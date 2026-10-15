@@ -1,0 +1,4308 @@
+-- tennis database for infomdw assignment 1
+-- this one file has everything for task 1 and task 2
+-- part 1 builds the tables and fills them with data
+-- part 2 has the five queries for task 2
+
+-- how to run it
+-- open the terminal in the folder where this sql file is saved
+-- start sqlite3 with any new file name and read this file with the read command
+
+-- stop at the first error so a mistake does not hide in the output
+.bail on
+
+-- sqlite does not check foreign keys unless we switch them on
+-- it has to be before any table work
+PRAGMA foreign_keys = ON;
+
+-- drop old tables first so the file can run again and again without errors
+-- order matters because a child table needs its parent so children are dropped first
+DROP TABLE IF EXISTS "match";
+DROP TABLE IF EXISTS tournament_entry;
+DROP TABLE IF EXISTS coach_player;
+DROP TABLE IF EXISTS player_nationalities;
+DROP TABLE IF EXISTS round;
+DROP TABLE IF EXISTS event;
+DROP TABLE IF EXISTS tournament_edition;
+DROP TABLE IF EXISTS venue;
+DROP TABLE IF EXISTS tournament_series;
+DROP TABLE IF EXISTS coach;
+DROP TABLE IF EXISTS player;
+DROP TABLE IF EXISTS city;
+DROP TABLE IF EXISTS country;
+
+
+-- part 1 database design
+
+-- quick guide to the words used below
+-- primary key is the column that identifies a row and it can never repeat
+-- unique means no two rows can have the same value
+-- check is a rule that every row has to follow
+-- foreign key points to a row in another table so we cannot save something that does not exist
+-- on delete restrict blocks the delete and cascade copies the change to the child rows
+-- set null keeps the row and just clears the link
+
+-- geography first
+-- country holds the countries
+CREATE TABLE country (
+    country_code CHAR(3) NOT NULL,
+    country      VARCHAR NOT NULL,
+    CONSTRAINT pk_country PRIMARY KEY (country_code),
+    CONSTRAINT uq_country_name UNIQUE (country),
+    -- country codes like NED or ESP are always 3 letters, and since sqlite3 ignores the number of characters, we enforce the length with the below check
+    CONSTRAINT ck_country_code CHECK (length(country_code) = 3)
+);
+
+-- a city belongs to one country
+-- the same city name can come again only in another country
+CREATE TABLE city (
+    city_id      INTEGER NOT NULL,
+    country_code CHAR(3) NOT NULL,
+    city         VARCHAR NOT NULL,
+    CONSTRAINT pk_city PRIMARY KEY (city_id),
+    CONSTRAINT uq_city UNIQUE (country_code, city),
+    -- a country that still has cities cannot be deleted
+    CONSTRAINT fk_city_country FOREIGN KEY (country_code) REFERENCES country (country_code)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+
+-- one row per player
+-- atp name weight turned pro and backhand can be empty because the source did not always have them
+-- a player must be at least 14 years old but a trigger further down checks that
+CREATE TABLE player (
+    player_id     VARCHAR NOT NULL,
+    player_name   VARCHAR NOT NULL,
+    -- atp refers to the association of tennis professionals
+    atp_name      VARCHAR,
+    -- gender and birthplace can also be null in this table
+    gender        CHAR(1),
+    birthdate     DATE    NOT NULL,
+    birthplace_id INTEGER,
+    weight_kg     INTEGER,
+    height_cm     INTEGER NOT NULL,
+    turned_pro    INTEGER,
+    hand          CHAR(1) NOT NULL,
+    -- 1h means one handed backhand and 2h means two handed backhand
+    backhand      CHAR(2),
+    CONSTRAINT pk_player PRIMARY KEY (player_id),
+    CONSTRAINT ck_player_gender   CHECK (gender IN ('M', 'F')), -- allow only F and M values in gender column
+    CONSTRAINT ck_player_hand     CHECK (hand IN ('R', 'L')), -- allow only R and L values in hand column
+    CONSTRAINT ck_player_backhand CHECK (backhand IN ('1H', '2H')), -- allow only 1H and 2H values in backhand column
+    -- if a city is deleted the player stays and only the birthplace becomes empty
+    CONSTRAINT fk_player_birthplace FOREIGN KEY (birthplace_id) REFERENCES city (city_id)
+        ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- coaches have their own table because a player can have many coaches and a coach can train many players
+CREATE TABLE coach (
+    coach_id        INTEGER NOT NULL,
+    coach_full_name VARCHAR NOT NULL,
+    CONSTRAINT pk_coach PRIMARY KEY (coach_id)
+);
+
+
+-- tournaments are stored in three levels
+-- series is the tournament itself like wimbledon
+-- edition is one year of that tournament
+-- event is one draw of an edition like the men's singles
+CREATE TABLE tournament_series (
+    series_id   INTEGER NOT NULL,
+    series_name VARCHAR NOT NULL,
+    category    VARCHAR NOT NULL,
+    CONSTRAINT pk_tournament_series PRIMARY KEY (series_id),
+    CONSTRAINT uq_series_name UNIQUE (series_name),
+    CONSTRAINT ck_series_category CHECK (category IN ('Grand Slam', 'Masters 1000')) -- allow only the categories the db was designed for
+);
+
+-- venue is the place where a tournament is played with its court surface
+CREATE TABLE venue (
+    venue_id   INTEGER NOT NULL,
+    venue_name VARCHAR NOT NULL,
+    city_id    INTEGER NOT NULL,
+    surface    VARCHAR NOT NULL,
+    CONSTRAINT pk_venue PRIMARY KEY (venue_id),
+    CONSTRAINT uq_venue UNIQUE (venue_name, city_id),
+    CONSTRAINT ck_venue_surface CHECK (surface IN ('Hard', 'Clay', 'Grass', 'Carpet')), -- allow only the correct surface types
+    CONSTRAINT fk_venue_city FOREIGN KEY (city_id) REFERENCES city (city_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- one edition is one year of a series played at one venue
+CREATE TABLE tournament_edition (
+    tourney_id VARCHAR NOT NULL,
+    series_id  INTEGER NOT NULL,
+    venue_id   INTEGER NOT NULL,
+    start_date DATE    NOT NULL,
+    CONSTRAINT pk_tournament_edition PRIMARY KEY (tourney_id),
+    CONSTRAINT uq_series_start UNIQUE (series_id, start_date),
+    CONSTRAINT fk_edition_series FOREIGN KEY (series_id) REFERENCES tournament_series (series_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_edition_venue FOREIGN KEY (venue_id) REFERENCES venue (venue_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- one event is one draw of an edition
+CREATE TABLE event (
+    event_id   INTEGER NOT NULL,
+    tourney_id VARCHAR NOT NULL,
+    gender     CHAR(1) NOT NULL,
+    draw_size  INTEGER NOT NULL,
+    best_of    INTEGER NOT NULL,
+    CONSTRAINT pk_event PRIMARY KEY (event_id),
+    -- unique on tourney and gender means only one draw per gender in each edition
+    CONSTRAINT uq_event UNIQUE (tourney_id, gender),
+    CONSTRAINT ck_event_gender    CHECK (gender IN ('M', 'F')),
+    CONSTRAINT ck_event_draw_size CHECK (draw_size IN (128, 96, 64, 56)),
+    CONSTRAINT ck_event_best_of   CHECK (best_of IN (3, 5)),
+    CONSTRAINT fk_event_edition FOREIGN KEY (tourney_id) REFERENCES tournament_edition (tourney_id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- round codes in playing order from R128 up to the final F
+-- sequence order lets us sort the rounds
+CREATE TABLE round (
+    round_code     VARCHAR NOT NULL,
+    round_name     VARCHAR NOT NULL,
+    sequence_order INTEGER NOT NULL,
+    CONSTRAINT pk_round PRIMARY KEY (round_code),
+    CONSTRAINT uq_round_name UNIQUE (round_name),
+    CONSTRAINT uq_round_order UNIQUE (sequence_order)
+);
+
+
+-- junction tables come next
+-- they connect two tables that have a many to many relation
+-- one row in a junction table is one link
+
+-- this one links players to countries over time
+-- start year is part of the key so a player can come back to the same country later
+-- an empty end year means the player still plays for that country
+-- if a player is deleted his rows go too but a country that is still used cannot be deleted
+CREATE TABLE player_nationalities (
+    player_id        VARCHAR NOT NULL,
+    nationality_code CHAR(3) NOT NULL,
+    start_year       INTEGER NOT NULL,
+    end_year         INTEGER,
+    CONSTRAINT pk_player_nationalities PRIMARY KEY (player_id, nationality_code, start_year),
+    CONSTRAINT ck_nationality_years CHECK (end_year >= start_year),
+    CONSTRAINT fk_nationality_player FOREIGN KEY (player_id) REFERENCES player (player_id)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_nationality_country FOREIGN KEY (nationality_code) REFERENCES country (country_code)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- every row links one player to one coach
+-- if the player or the coach is deleted the link goes away too
+CREATE TABLE coach_player (
+    player_id VARCHAR NOT NULL,
+    coach_id  INTEGER NOT NULL,
+    CONSTRAINT pk_coach_player PRIMARY KEY (player_id, coach_id),
+    CONSTRAINT fk_coach_player_player FOREIGN KEY (player_id) REFERENCES player (player_id)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_coach_player_coach FOREIGN KEY (coach_id) REFERENCES coach (coach_id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- this is the entry list of an event
+-- a row says that this player played this event with a seed and a ranking
+-- the primary key is event plus player so nobody enters the same event twice
+CREATE TABLE tournament_entry (
+    event_id    INTEGER NOT NULL,
+    player_id   VARCHAR NOT NULL,
+    seed        INTEGER,
+    -- q means qualifier and wc means wild card
+    -- ll means lucky loser and pr means protected ranking
+    -- se means special exempt
+    entry       VARCHAR,
+    "rank"      INTEGER,
+    rank_points INTEGER,
+    CONSTRAINT pk_tournament_entry PRIMARY KEY (event_id, player_id),
+    -- two players in the same event cannot have the same seed
+    CONSTRAINT uq_entry_seed UNIQUE (event_id, seed),
+    CONSTRAINT ck_entry_seed        CHECK (seed BETWEEN 1 AND 32),
+    CONSTRAINT ck_entry_type        CHECK (entry IN ('Q', 'WC', 'LL', 'PR', 'SE')),
+    CONSTRAINT ck_entry_rank        CHECK ("rank" > 0),
+    CONSTRAINT ck_entry_rank_points CHECK (rank_points > 0),
+    -- rank and rank points must both be filled or both be empty
+    CONSTRAINT ck_entry_rank_pair   CHECK (("rank" IS NULL) = (rank_points IS NULL)),
+    CONSTRAINT fk_entry_event FOREIGN KEY (event_id) REFERENCES event (event_id)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_entry_player FOREIGN KEY (player_id) REFERENCES player (player_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+
+-- one row per match
+-- winner columns start with w and loser columns start with l
+-- stats can be empty for example when a match ended with a walkover
+-- match is in double quotes to prevent sqlite3 from reading it as an SQL keyword
+CREATE TABLE "match" (
+    match_id   INTEGER NOT NULL,
+    event_id   INTEGER NOT NULL,
+    match_date DATE    NOT NULL,
+    match_num  INTEGER NOT NULL,
+    indoor     CHAR(1) NOT NULL,
+    winner_id  VARCHAR NOT NULL,
+    loser_id   VARCHAR NOT NULL,
+    score      VARCHAR,
+    round_code VARCHAR NOT NULL,
+    minutes    INTEGER,
+    -- df means double faults and svpt means service points played
+    -- 1stin means first serves in and 1stwon means points won on first serve
+    -- 2ndwon means points won on second serve and svgms means service games played
+    -- bpsaved means break points saved and bpfaced means break points faced
+    -- these meanings apply to both winner and loser columns
+    w_ace INTEGER,
+    w_df INTEGER,
+    w_svpt INTEGER,
+    w_1stIn INTEGER,
+    w_1stWon INTEGER,
+    w_2ndWon INTEGER,
+    w_SvGms INTEGER,
+    w_bpSaved INTEGER,
+    w_bpFaced INTEGER,
+    l_ace INTEGER,
+    l_df INTEGER,
+    l_svpt INTEGER,
+    l_1stIn INTEGER,
+    l_1stWon INTEGER,
+    l_2ndWon INTEGER,
+    l_SvGms INTEGER,
+    l_bpSaved INTEGER,
+    l_bpFaced INTEGER,
+    CONSTRAINT pk_match PRIMARY KEY (match_id),
+    -- every match has its own number inside an event
+    -- the same result cannot be saved twice in one event
+    CONSTRAINT uq_match_number UNIQUE (event_id, match_num),
+    CONSTRAINT uq_match_pair UNIQUE (event_id, winner_id, loser_id),
+    CONSTRAINT uq_event_match_loser UNIQUE (event_id, loser_id),
+    CONSTRAINT uq_event_match_winner_round UNIQUE (event_id, winner_id, round_code),
+    CONSTRAINT ck_match_indoor CHECK (indoor IN ('O', 'I')), -- either indoors or outdoors
+    -- a player cannot play against himself
+    CONSTRAINT ck_match_players CHECK (winner_id <> loser_id),
+    -- minutes must be above 0 and the stats cannot be negative
+    CONSTRAINT ck_match_minutes CHECK (minutes > 0),
+    CONSTRAINT ck_match_w_ace CHECK (w_ace IS NULL OR w_ace >= 0),
+    CONSTRAINT ck_match_w_df CHECK (w_df IS NULL OR w_df >= 0),
+    CONSTRAINT ck_match_w_svpt CHECK (w_svpt IS NULL OR w_svpt >= 0),
+    CONSTRAINT ck_match_w_1stin CHECK (w_1stIn IS NULL OR w_1stIn >= 0),
+    CONSTRAINT ck_match_w_1stwon CHECK (w_1stWon IS NULL OR w_1stWon >= 0),
+    CONSTRAINT ck_match_w_2ndwon CHECK (w_2ndWon IS NULL OR w_2ndWon >= 0),
+    CONSTRAINT ck_match_w_svgms CHECK (w_SvGms IS NULL OR w_SvGms >= 0),
+    CONSTRAINT ck_match_w_bpsaved CHECK (w_bpSaved IS NULL OR w_bpSaved >= 0),
+    CONSTRAINT ck_match_w_bpfaced CHECK (w_bpFaced IS NULL OR w_bpFaced >= 0),
+    CONSTRAINT ck_match_l_ace CHECK (l_ace IS NULL OR l_ace >= 0),
+    CONSTRAINT ck_match_l_df CHECK (l_df IS NULL OR l_df >= 0),
+    CONSTRAINT ck_match_l_svpt CHECK (l_svpt IS NULL OR l_svpt >= 0),
+    CONSTRAINT ck_match_l_1stin CHECK (l_1stIn IS NULL OR l_1stIn >= 0),
+    CONSTRAINT ck_match_l_1stwon CHECK (l_1stWon IS NULL OR l_1stWon >= 0),
+    CONSTRAINT ck_match_l_2ndwon CHECK (l_2ndWon IS NULL OR l_2ndWon >= 0),
+    CONSTRAINT ck_match_l_svgms CHECK (l_SvGms IS NULL OR l_SvGms >= 0),
+    CONSTRAINT ck_match_l_bpsaved CHECK (l_bpSaved IS NULL OR l_bpSaved >= 0),
+    CONSTRAINT ck_match_l_bpfaced CHECK (l_bpFaced IS NULL OR l_bpFaced >= 0),
+    CONSTRAINT fk_match_event FOREIGN KEY (event_id) REFERENCES event (event_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_match_round FOREIGN KEY (round_code) REFERENCES round (round_code)
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    -- winner and loser both point to the entry list
+    -- two columns together point to one entry row so both players must have entered that event
+    CONSTRAINT fk_match_winner FOREIGN KEY (event_id, winner_id) REFERENCES tournament_entry (event_id, player_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_match_loser FOREIGN KEY (event_id, loser_id) REFERENCES tournament_entry (event_id, player_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+
+-- indexes make searching and joining faster
+-- we add them on foreign key columns because we join on them a lot
+-- primary keys and unique constraints already get an index from sqlite so they are not repeated
+CREATE INDEX idx_player_birthplace   ON player (birthplace_id);
+CREATE INDEX idx_venue_city          ON venue (city_id);
+CREATE INDEX idx_edition_series      ON tournament_edition (series_id);
+CREATE INDEX idx_edition_venue       ON tournament_edition (venue_id);
+CREATE INDEX idx_nationality_country ON player_nationalities (nationality_code);
+CREATE INDEX idx_coach_player_coach  ON coach_player (coach_id);
+CREATE INDEX idx_entry_player        ON tournament_entry (player_id);
+CREATE INDEX idx_match_round         ON "match" (round_code);
+CREATE INDEX idx_match_loser         ON "match" (event_id, loser_id);
+
+
+-- triggers run a small check before an insert or an update
+-- we need them because sqlite does not allow the current date inside a check
+-- each rule has two triggers one for insert and one for update
+-- when a rule is broken the trigger stops the change with an error message
+
+-- a player must be at least 14 years old
+-- new refers to the proposed row values
+CREATE TRIGGER trg_player_birthdate_ins BEFORE INSERT ON player
+WHEN NEW.birthdate > date('now', '-14 years')
+BEGIN
+    SELECT RAISE(ABORT, 'player must be at least 14 years old');
+END;
+
+CREATE TRIGGER trg_player_birthdate_upd BEFORE UPDATE OF birthdate ON player
+WHEN NEW.birthdate > date('now', '-14 years')
+BEGIN
+    SELECT RAISE(ABORT, 'player must be at least 14 years old');
+END;
+
+-- the turned pro year cannot be in the future
+-- strftime extracts the current year and cast converts it to a number
+CREATE TRIGGER trg_player_turned_pro_ins BEFORE INSERT ON player
+WHEN NEW.turned_pro > CAST(strftime('%Y', 'now') AS INTEGER)
+BEGIN
+    SELECT RAISE(ABORT, 'turned_pro cannot be later than the current year');
+END;
+
+CREATE TRIGGER trg_player_turned_pro_upd BEFORE UPDATE OF turned_pro ON player
+WHEN NEW.turned_pro > CAST(strftime('%Y', 'now') AS INTEGER)
+BEGIN
+    SELECT RAISE(ABORT, 'turned_pro cannot be later than the current year');
+END;
+
+-- the start year of a nationality cannot be in the future
+CREATE TRIGGER trg_nationality_start_ins BEFORE INSERT ON player_nationalities
+WHEN NEW.start_year > CAST(strftime('%Y', 'now') AS INTEGER)
+BEGIN
+    SELECT RAISE(ABORT, 'start_year cannot be later than the current year');
+END;
+
+CREATE TRIGGER trg_nationality_start_upd BEFORE UPDATE OF start_year ON player_nationalities
+WHEN NEW.start_year > CAST(strftime('%Y', 'now') AS INTEGER)
+BEGIN
+    SELECT RAISE(ABORT, 'start_year cannot be later than the current year');
+END;
+
+
+-- loading the data
+-- the data is written in this file so read can build the database directly
+-- parents are loaded first and children later so every foreign key finds its row
+
+-- one transaction so all inserts work together or nothing is saved
+-- the inserts are saved together only when commit is reached
+-- a failed statement does not automatically undo earlier inserts in the transaction
+-- if an error leaves the session open use rollback to discard pending inserts
+-- the earlier table changes are outside this transaction
+BEGIN TRANSACTION;
+
+-- load country rows
+INSERT INTO country VALUES('ARG','Argentina');
+INSERT INTO country VALUES('AUS','Australia');
+INSERT INTO country VALUES('AUT','Austria');
+INSERT INTO country VALUES('BEL','Belgium');
+INSERT INTO country VALUES('BIH','Bosnia and Herzegovina');
+INSERT INTO country VALUES('BOL','Bolivia');
+INSERT INTO country VALUES('BRA','Brazil');
+INSERT INTO country VALUES('BUL','Bulgaria');
+INSERT INTO country VALUES('CAN','Canada');
+INSERT INTO country VALUES('CHI','Chile');
+INSERT INTO country VALUES('CHN','China');
+INSERT INTO country VALUES('COL','Colombia');
+INSERT INTO country VALUES('CRO','Croatia');
+INSERT INTO country VALUES('CZE','Czechia');
+INSERT INTO country VALUES('DEN','Denmark');
+INSERT INTO country VALUES('ESP','Spain');
+INSERT INTO country VALUES('FIN','Finland');
+INSERT INTO country VALUES('FRA','France');
+INSERT INTO country VALUES('GBR','Great Britain');
+INSERT INTO country VALUES('GEO','Georgia');
+INSERT INTO country VALUES('GER','Germany');
+INSERT INTO country VALUES('GRE','Greece');
+INSERT INTO country VALUES('HKG','Hong Kong');
+INSERT INTO country VALUES('HUN','Hungary');
+INSERT INTO country VALUES('IND','India');
+INSERT INTO country VALUES('ITA','Italy');
+INSERT INTO country VALUES('JPN','Japan');
+INSERT INTO country VALUES('KAZ','Kazakhstan');
+INSERT INTO country VALUES('LBN','Lebanon');
+INSERT INTO country VALUES('LTU','Lithuania');
+INSERT INTO country VALUES('LUX','Luxembourg');
+INSERT INTO country VALUES('MON','Monaco');
+INSERT INTO country VALUES('NED','Netherlands');
+INSERT INTO country VALUES('NOR','Norway');
+INSERT INTO country VALUES('PER','Peru');
+INSERT INTO country VALUES('PHI','Philippines');
+INSERT INTO country VALUES('POL','Poland');
+INSERT INTO country VALUES('POR','Portugal');
+INSERT INTO country VALUES('ROU','Romania');
+INSERT INTO country VALUES('RSA','South Africa');
+INSERT INTO country VALUES('RUS','Russia');
+INSERT INTO country VALUES('SRB','Serbia');
+INSERT INTO country VALUES('SUI','Switzerland');
+INSERT INTO country VALUES('SVK','Slovakia');
+INSERT INTO country VALUES('THA','Thailand');
+INSERT INTO country VALUES('TPE','Chinese Taipei');
+INSERT INTO country VALUES('TUN','Tunisia');
+INSERT INTO country VALUES('USA','United States');
+
+-- load city rows
+INSERT INTO city VALUES(1,'ARG','9 de Julio');
+INSERT INTO city VALUES(2,'ARG','Buenos Aires');
+INSERT INTO city VALUES(3,'ARG','La Plata');
+INSERT INTO city VALUES(4,'ARG','Mar del Plata');
+INSERT INTO city VALUES(5,'ARG','Merlo');
+INSERT INTO city VALUES(6,'ARG','Rosario');
+INSERT INTO city VALUES(7,'ARG','Villa Gesell');
+INSERT INTO city VALUES(8,'AUS','Adelaide');
+INSERT INTO city VALUES(9,'AUS','Brisbane');
+INSERT INTO city VALUES(10,'AUS','Canberra');
+INSERT INTO city VALUES(11,'AUS','Melbourne');
+INSERT INTO city VALUES(12,'AUS','Murray Bridge');
+INSERT INTO city VALUES(13,'AUS','Perth');
+INSERT INTO city VALUES(14,'AUS','Sydney');
+INSERT INTO city VALUES(15,'AUT','Bruck an der Mur');
+INSERT INTO city VALUES(16,'AUT','Graz');
+INSERT INTO city VALUES(17,'BEL','Antwerp');
+INSERT INTO city VALUES(18,'BEL','Lia Ge');
+INSERT INTO city VALUES(19,'BEL','Lommel');
+INSERT INTO city VALUES(20,'BEL','Rocourt');
+INSERT INTO city VALUES(21,'BIH','Medjugorje');
+INSERT INTO city VALUES(22,'BIH','Sarajevo');
+INSERT INTO city VALUES(23,'BOL','Trinidad');
+INSERT INTO city VALUES(24,'BRA','Fortaleza');
+INSERT INTO city VALUES(25,'BRA','Marechal Candido Rondon');
+INSERT INTO city VALUES(26,'BRA','Rio de Janeiro');
+INSERT INTO city VALUES(27,'BUL','Haskovo');
+INSERT INTO city VALUES(28,'CAN','Laval');
+INSERT INTO city VALUES(29,'CAN','Montreal');
+INSERT INTO city VALUES(30,'CAN','Newmarket');
+INSERT INTO city VALUES(31,'CAN','Richmond Hill');
+INSERT INTO city VALUES(32,'CAN','Toronto');
+INSERT INTO city VALUES(33,'CAN','Vernon');
+INSERT INTO city VALUES(34,'CHI','Chillan');
+INSERT INTO city VALUES(35,'CHI','Santiago');
+INSERT INTO city VALUES(36,'CHN','Beijing');
+INSERT INTO city VALUES(37,'CHN','Hangzhou');
+INSERT INTO city VALUES(38,'CHN','Shanghai');
+INSERT INTO city VALUES(39,'CHN','Xinjiang');
+INSERT INTO city VALUES(40,'COL','Bucaramanga');
+INSERT INTO city VALUES(41,'CRO','Split');
+INSERT INTO city VALUES(42,'CRO','Zagreb');
+INSERT INTO city VALUES(43,'CZE','Beroun');
+INSERT INTO city VALUES(44,'CZE','Bilovec');
+INSERT INTO city VALUES(45,'CZE','Mlada Boleslav');
+INSERT INTO city VALUES(46,'CZE','Ostrava');
+INSERT INTO city VALUES(47,'CZE','Prostejov');
+INSERT INTO city VALUES(48,'DEN','Aarhus');
+INSERT INTO city VALUES(49,'DEN','Espergaerde');
+INSERT INTO city VALUES(50,'DEN','Gentofte');
+INSERT INTO city VALUES(51,'ESP','Alzira');
+INSERT INTO city VALUES(52,'ESP','Barcelona');
+INSERT INTO city VALUES(53,'ESP','Castellon de la Plana');
+INSERT INTO city VALUES(54,'ESP','El Palmar');
+INSERT INTO city VALUES(55,'ESP','Gijon');
+INSERT INTO city VALUES(56,'ESP','Jerez de la Frontera');
+INSERT INTO city VALUES(57,'ESP','Madrid');
+INSERT INTO city VALUES(58,'ESP','Malaga');
+INSERT INTO city VALUES(59,'ESP','Santanyi');
+INSERT INTO city VALUES(60,'ESP','Tenerife');
+INSERT INTO city VALUES(61,'ESP','Valencia');
+INSERT INTO city VALUES(62,'FIN','Helsinki');
+INSERT INTO city VALUES(63,'FIN','Hyvinkaa');
+INSERT INTO city VALUES(64,'FRA','Beziers');
+INSERT INTO city VALUES(65,'FRA','Bondoufle');
+INSERT INTO city VALUES(66,'FRA','Bondy');
+INSERT INTO city VALUES(67,'FRA','Gassin');
+INSERT INTO city VALUES(68,'FRA','Grande-Synthe');
+INSERT INTO city VALUES(69,'FRA','Lyon');
+INSERT INTO city VALUES(70,'FRA','Metz');
+INSERT INTO city VALUES(71,'FRA','Montpellier');
+INSERT INTO city VALUES(72,'FRA','Nanterre');
+INSERT INTO city VALUES(73,'FRA','Neuilly-sur-Seine');
+INSERT INTO city VALUES(74,'FRA','Nimes');
+INSERT INTO city VALUES(75,'FRA','Paris');
+INSERT INTO city VALUES(76,'FRA','Poissy');
+INSERT INTO city VALUES(77,'FRA','Reims');
+INSERT INTO city VALUES(78,'FRA','Roquebrune-Cap-Martin');
+INSERT INTO city VALUES(79,'FRA','Sa Vres');
+INSERT INTO city VALUES(80,'FRA','Saint-Julien-en-Genevois');
+INSERT INTO city VALUES(81,'FRA','Saint-Martin-Boulogne');
+INSERT INTO city VALUES(82,'FRA','Schiltigheim');
+INSERT INTO city VALUES(83,'FRA','Soisy-sous-Montmorency');
+INSERT INTO city VALUES(84,'FRA','Toulouse');
+INSERT INTO city VALUES(85,'GBR','Birmingham');
+INSERT INTO city VALUES(86,'GBR','Derby');
+INSERT INTO city VALUES(87,'GBR','Hull');
+INSERT INTO city VALUES(88,'GBR','Kingston upon Thames');
+INSERT INTO city VALUES(89,'GBR','London');
+INSERT INTO city VALUES(90,'GBR','Nottingham');
+INSERT INTO city VALUES(91,'GBR','St');
+INSERT INTO city VALUES(92,'GBR','Sutton');
+INSERT INTO city VALUES(93,'GBR','Wolverhampton');
+INSERT INTO city VALUES(94,'GBR','Worcester');
+INSERT INTO city VALUES(95,'GEO','Tbilisi');
+INSERT INTO city VALUES(96,'GER','Furtwangen');
+INSERT INTO city VALUES(97,'GER','Hamburg');
+INSERT INTO city VALUES(98,'GER','Karlsruhe');
+INSERT INTO city VALUES(99,'GER','Kempen');
+INSERT INTO city VALUES(100,'GER','Merzig');
+INSERT INTO city VALUES(101,'GER','Nuremberg');
+INSERT INTO city VALUES(102,'GER','Warstein');
+INSERT INTO city VALUES(103,'GRE','Athens');
+INSERT INTO city VALUES(104,'HKG','Hong Kong');
+INSERT INTO city VALUES(105,'HUN','Budapest');
+INSERT INTO city VALUES(106,'HUN','Nyiregyhaza');
+INSERT INTO city VALUES(107,'IND','Jhajjar');
+INSERT INTO city VALUES(108,'ITA','Busto Arsizio');
+INSERT INTO city VALUES(109,'ITA','Carrara');
+INSERT INTO city VALUES(110,'ITA','Florence');
+INSERT INTO city VALUES(111,'ITA','Palermo');
+INSERT INTO city VALUES(112,'ITA','Perugia');
+INSERT INTO city VALUES(113,'ITA','Pesaro');
+INSERT INTO city VALUES(114,'ITA','Rome');
+INSERT INTO city VALUES(115,'ITA','San Candido');
+INSERT INTO city VALUES(116,'ITA','Sanremo');
+INSERT INTO city VALUES(117,'ITA','Turin');
+INSERT INTO city VALUES(118,'JPN','Kawasaki');
+INSERT INTO city VALUES(119,'JPN','Mie');
+INSERT INTO city VALUES(120,'JPN','Nagoya');
+INSERT INTO city VALUES(121,'JPN','Nishinomiya');
+INSERT INTO city VALUES(122,'JPN','Saitama');
+INSERT INTO city VALUES(123,'JPN','Shimane');
+INSERT INTO city VALUES(124,'KAZ','Aktau');
+INSERT INTO city VALUES(125,'LTU','Siauliai');
+INSERT INTO city VALUES(126,'LUX','Luxembourg');
+INSERT INTO city VALUES(127,'MON','Monaco');
+INSERT INTO city VALUES(128,'NED','Haarlem');
+INSERT INTO city VALUES(129,'NED','Wageningen');
+INSERT INTO city VALUES(130,'NOR','Oslo');
+INSERT INTO city VALUES(131,'PER','Lima');
+INSERT INTO city VALUES(132,'PHI','Iba Zambales');
+INSERT INTO city VALUES(133,'POL','Piotrkow Trybunalski');
+INSERT INTO city VALUES(134,'POL','Wroclaw');
+INSERT INTO city VALUES(135,'POR','Lisbon');
+INSERT INTO city VALUES(136,'POR','Maia');
+INSERT INTO city VALUES(137,'POR','Porto');
+INSERT INTO city VALUES(138,'ROU','Bucharest');
+INSERT INTO city VALUES(139,'RSA','Cape Town');
+INSERT INTO city VALUES(140,'RSA','Johannesburg');
+INSERT INTO city VALUES(141,'RUS','Gatchina');
+INSERT INTO city VALUES(142,'RUS','Moscow');
+INSERT INTO city VALUES(143,'RUS','Podolsk');
+INSERT INTO city VALUES(144,'RUS','Rostov-On-Don');
+INSERT INTO city VALUES(145,'SRB','Belgrade');
+INSERT INTO city VALUES(146,'SRB','Novi Pazar');
+INSERT INTO city VALUES(147,'SRB','Senta');
+INSERT INTO city VALUES(148,'SUI','Frauenfeld');
+INSERT INTO city VALUES(149,'SUI','Grosshochstetten');
+INSERT INTO city VALUES(150,'SUI','Lausanne');
+INSERT INTO city VALUES(151,'SUI','Rheinfelden');
+INSERT INTO city VALUES(152,'SVK','Spisska Nova Ves');
+INSERT INTO city VALUES(153,'THA','Bangkok');
+INSERT INTO city VALUES(154,'TPE','Taipei');
+INSERT INTO city VALUES(155,'TUN','La Marsa');
+INSERT INTO city VALUES(156,'USA','Altadena');
+INSERT INTO city VALUES(157,'USA','Atlanta');
+INSERT INTO city VALUES(158,'USA','Boca Raton');
+INSERT INTO city VALUES(159,'USA','Bradenton');
+INSERT INTO city VALUES(160,'USA','Durham');
+INSERT INTO city VALUES(161,'USA','Fort Worth');
+INSERT INTO city VALUES(162,'USA','Fresno');
+INSERT INTO city VALUES(163,'USA','Greenwich');
+INSERT INTO city VALUES(164,'USA','Houston');
+INSERT INTO city VALUES(165,'USA','Hyattsville');
+INSERT INTO city VALUES(166,'USA','Indian Wells');
+INSERT INTO city VALUES(167,'USA','Irvine');
+INSERT INTO city VALUES(168,'USA','La Jolla');
+INSERT INTO city VALUES(169,'USA','Laguna Hills');
+INSERT INTO city VALUES(170,'USA','Mason');
+INSERT INTO city VALUES(171,'USA','Miami Gardens');
+INSERT INTO city VALUES(172,'USA','New York');
+INSERT INTO city VALUES(173,'USA','New York City');
+INSERT INTO city VALUES(174,'USA','Newport Beach');
+INSERT INTO city VALUES(175,'USA','Olympia');
+INSERT INTO city VALUES(176,'USA','Piedmont');
+INSERT INTO city VALUES(177,'USA','Rancho Santa Fe');
+INSERT INTO city VALUES(178,'USA','Rochester');
+INSERT INTO city VALUES(179,'USA','Rolling Hills');
+INSERT INTO city VALUES(180,'USA','Sacramento');
+INSERT INTO city VALUES(181,'USA','San Diego');
+INSERT INTO city VALUES(182,'USA','Spartanburg');
+INSERT INTO city VALUES(183,'USA','St');
+INSERT INTO city VALUES(184,'USA','Thousand Oaks');
+INSERT INTO city VALUES(185,'USA','Voorhees');
+INSERT INTO city VALUES(186,'USA','Woodland Hills');
+
+-- load round rows
+INSERT INTO round VALUES('R128','Round of 128',1);
+INSERT INTO round VALUES('R64','Round of 64',2);
+INSERT INTO round VALUES('R32','Round of 32',3);
+INSERT INTO round VALUES('R16','Round of 16',4);
+INSERT INTO round VALUES('QF','Quarterfinal',5);
+INSERT INTO round VALUES('SF','Semifinal',6);
+INSERT INTO round VALUES('F','Final',7);
+
+-- load coach rows
+INSERT INTO coach VALUES(1,'Adam Kellner');
+INSERT INTO coach VALUES(2,'Admir Jasika');
+INSERT INTO coach VALUES(3,'Adolfo Gutierrez');
+INSERT INTO coach VALUES(4,'Alberto Mancini');
+INSERT INTO coach VALUES(5,'Alberto Martin');
+INSERT INTO coach VALUES(6,'Alejandro Fabbri');
+INSERT INTO coach VALUES(7,'Alejandro Gonzalez');
+INSERT INTO coach VALUES(8,'Alen Avidzba');
+INSERT INTO coach VALUES(9,'Alessandro Bega');
+INSERT INTO coach VALUES(10,'Alessandro Petrone');
+INSERT INTO coach VALUES(11,'Alex Funkhouser');
+INSERT INTO coach VALUES(12,'Alexander Zverev Sr.');
+INSERT INTO coach VALUES(13,'Anders Johansson');
+INSERT INTO coach VALUES(14,'AndrA Lopes');
+INSERT INTO coach VALUES(15,'Andrea Morlet');
+INSERT INTO coach VALUES(16,'Andres Dellatorre');
+INSERT INTO coach VALUES(17,'Andres Schneiter');
+INSERT INTO coach VALUES(18,'Andrew Roberts');
+INSERT INTO coach VALUES(19,'Angelo Novkovic');
+INSERT INTO coach VALUES(20,'Anthony Harris');
+INSERT INTO coach VALUES(21,'Antonio Pastorino');
+INSERT INTO coach VALUES(22,'Antonio Sancic');
+INSERT INTO coach VALUES(23,'Antonio Vei');
+INSERT INTO coach VALUES(24,'Apostolos Tsitsipas');
+INSERT INTO coach VALUES(25,'Ariana Saki');
+INSERT INTO coach VALUES(26,'Artem Suprunov');
+INSERT INTO coach VALUES(27,'Attila Piros');
+INSERT INTO coach VALUES(28,'Bas Van Bentum');
+INSERT INTO coach VALUES(29,'Ben Milner');
+INSERT INTO coach VALUES(30,'Benjamin Balleret');
+INSERT INTO coach VALUES(31,'Benjamin Ebrahimzadeh');
+INSERT INTO coach VALUES(32,'Benoit Foucher');
+INSERT INTO coach VALUES(33,'Billy Heiser');
+INSERT INTO coach VALUES(34,'Brad Stine');
+INSERT INTO coach VALUES(35,'Brian Garber');
+INSERT INTO coach VALUES(36,'Bryan Shelton');
+INSERT INTO coach VALUES(37,'Bryan Smith');
+INSERT INTO coach VALUES(38,'Carlos Berlocq');
+INSERT INTO coach VALUES(39,'Carlos Eduardo Matos');
+INSERT INTO coach VALUES(40,'Carsten Arriens');
+INSERT INTO coach VALUES(41,'Cesar Fabregas');
+INSERT INTO coach VALUES(42,'Christian Ruud');
+INSERT INTO coach VALUES(43,'Christopher Kas');
+INSERT INTO coach VALUES(44,'Christopher Williams');
+INSERT INTO coach VALUES(45,'Claudio Galoppini');
+INSERT INTO coach VALUES(46,'Craig Boynton');
+INSERT INTO coach VALUES(47,'Craig Kardon');
+INSERT INTO coach VALUES(48,'Damion Jackson');
+INSERT INTO coach VALUES(49,'Daniel Gimeno-Traver');
+INSERT INTO coach VALUES(50,'Daniel Vacek');
+INSERT INTO coach VALUES(51,'Daniel Vallverdu');
+INSERT INTO coach VALUES(52,'Dante Bottini');
+INSERT INTO coach VALUES(53,'Darren Cahill');
+INSERT INTO coach VALUES(54,'David Macpherson');
+INSERT INTO coach VALUES(55,'David Nainkin');
+INSERT INTO coach VALUES(56,'David Sanchez');
+INSERT INTO coach VALUES(57,'David Witt');
+INSERT INTO coach VALUES(58,'Dennis Sporrel');
+INSERT INTO coach VALUES(59,'Eduard Esteve');
+INSERT INTO coach VALUES(60,'Emmanuel Planque');
+INSERT INTO coach VALUES(61,'Eric Nunez');
+INSERT INTO coach VALUES(62,'Eric Winogradsky');
+INSERT INTO coach VALUES(63,'Erik Kortland');
+INSERT INTO coach VALUES(64,'Erwann Tortuyaux');
+INSERT INTO coach VALUES(65,'Esteban Carril');
+INSERT INTO coach VALUES(66,'Evgeny Donskoy');
+INSERT INTO coach VALUES(67,'FabiAn Blengino');
+INSERT INTO coach VALUES(68,'Fabio Chiappini');
+INSERT INTO coach VALUES(69,'Fabio Colangelo');
+INSERT INTO coach VALUES(70,'Fabrice Martin');
+INSERT INTO coach VALUES(71,'Facundo Lugones');
+INSERT INTO coach VALUES(72,'Federico Ricci');
+INSERT INTO coach VALUES(73,'Felix Mantilla');
+INSERT INTO coach VALUES(74,'Fernando Vicente');
+INSERT INTO coach VALUES(75,'Filippo Baldi');
+INSERT INTO coach VALUES(76,'Fran Penalva');
+INSERT INTO coach VALUES(77,'Francesco Cina');
+INSERT INTO coach VALUES(78,'Franko Skugor');
+INSERT INTO coach VALUES(79,'Fred Hemmes');
+INSERT INTO coach VALUES(80,'Frederic Fontang');
+INSERT INTO coach VALUES(81,'Frederik Nielsen');
+INSERT INTO coach VALUES(82,'Friedrich Kunath');
+INSERT INTO coach VALUES(83,'Gabriele Costantini');
+INSERT INTO coach VALUES(84,'Gavin Van Peperzeel');
+INSERT INTO coach VALUES(85,'Geoff Harris');
+INSERT INTO coach VALUES(86,'Gerald Radovici');
+INSERT INTO coach VALUES(87,'GermAn Gaich');
+INSERT INTO coach VALUES(88,'Gianluca Carbone');
+INSERT INTO coach VALUES(89,'Gilles Cervara');
+INSERT INTO coach VALUES(90,'Guilherme Teixeira');
+INSERT INTO coach VALUES(91,'Guillermo Gomez');
+INSERT INTO coach VALUES(92,'Gyorgy Balazs');
+INSERT INTO coach VALUES(93,'Hasan Ibrahim');
+INSERT INTO coach VALUES(94,'Horacio De La PeAa');
+INSERT INTO coach VALUES(95,'Horacio Matta');
+INSERT INTO coach VALUES(96,'Hugo Anao');
+INSERT INTO coach VALUES(97,'Hugo Armando');
+INSERT INTO coach VALUES(98,'Hugo Guerriero');
+INSERT INTO coach VALUES(99,'Ian OaTMConnell');
+INSERT INTO coach VALUES(100,'Ivan Cinkus');
+INSERT INTO coach VALUES(101,'Ivan Lendl');
+INSERT INTO coach VALUES(102,'Jacob Holst');
+INSERT INTO coach VALUES(103,'James Allemby');
+INSERT INTO coach VALUES(104,'James Trotman');
+INSERT INTO coach VALUES(105,'Jamie Delgado');
+INSERT INTO coach VALUES(106,'Jan De Witt');
+INSERT INTO coach VALUES(107,'Jan Satral');
+INSERT INTO coach VALUES(108,'Jaroslav Pospisil');
+INSERT INTO coach VALUES(109,'Javier Fernandez');
+INSERT INTO coach VALUES(110,'Jay Berger');
+INSERT INTO coach VALUES(111,'Jay Gooding');
+INSERT INTO coach VALUES(112,'Jean Demeroutis');
+INSERT INTO coach VALUES(113,'Jean Roch Herbert');
+INSERT INTO coach VALUES(114,'Jonas Svendsen');
+INSERT INTO coach VALUES(115,'Jordi Arconada');
+INSERT INTO coach VALUES(116,'Jorge Aguirre');
+INSERT INTO coach VALUES(117,'Jose Antonio Sanchez-de Luna');
+INSERT INTO coach VALUES(118,'Jose Checa Calvo');
+INSERT INTO coach VALUES(119,'Jose Clavet');
+INSERT INTO coach VALUES(120,'Jose Luis Vendrell Bru');
+INSERT INTO coach VALUES(121,'Jose Maria Diaz');
+INSERT INTO coach VALUES(122,'Jose Maria Garrido Ros');
+INSERT INTO coach VALUES(123,'Jose Perlas');
+INSERT INTO coach VALUES(124,'Juan Carlos Ferrero');
+INSERT INTO coach VALUES(125,'Juan Martin');
+INSERT INTO coach VALUES(126,'Julien Cassaigne');
+INSERT INTO coach VALUES(127,'Julien Gillet');
+INSERT INTO coach VALUES(128,'Karol Kucera');
+INSERT INTO coach VALUES(129,'Karue Sell');
+INSERT INTO coach VALUES(130,'Keisuke Numajiri');
+INSERT INTO coach VALUES(131,'Keisuke Watanuki');
+INSERT INTO coach VALUES(132,'Kenneth Carlsen');
+INSERT INTO coach VALUES(133,'Kevin Konfederak');
+INSERT INTO coach VALUES(134,'Kristof Vliegen');
+INSERT INTO coach VALUES(135,'Lars Christensen');
+INSERT INTO coach VALUES(136,'Leonardo Mayer');
+INSERT INTO coach VALUES(137,'Liliya Kotova');
+INSERT INTO coach VALUES(138,'Lionel Zimbler');
+INSERT INTO coach VALUES(139,'Luciano Carluccio');
+INSERT INTO coach VALUES(140,'Luciano Enrique Darderi');
+INSERT INTO coach VALUES(141,'Luka Kutanjac');
+INSERT INTO coach VALUES(142,'Maciej Domka');
+INSERT INTO coach VALUES(143,'Magnus Norman');
+INSERT INTO coach VALUES(144,'Marcelo Filippini');
+INSERT INTO coach VALUES(145,'Marco Gulisano');
+INSERT INTO coach VALUES(146,'Marek Jaloviec');
+INSERT INTO coach VALUES(147,'Mariano Hood');
+INSERT INTO coach VALUES(148,'Mariano Monachesi');
+INSERT INTO coach VALUES(149,'Mariano Puerta');
+INSERT INTO coach VALUES(150,'Mario Tudor');
+INSERT INTO coach VALUES(151,'Mark Draper');
+INSERT INTO coach VALUES(152,'Markus Hipfl');
+INSERT INTO coach VALUES(153,'Martin Alund');
+INSERT INTO coach VALUES(154,'Martin Damm Sr.');
+INSERT INTO coach VALUES(155,'Martin Laurendeau');
+INSERT INTO coach VALUES(156,'Martin Stepanek');
+INSERT INTO coach VALUES(157,'Massimo Sartori');
+INSERT INTO coach VALUES(158,'Mate Delic');
+INSERT INTO coach VALUES(159,'Matteo Civarolo');
+INSERT INTO coach VALUES(160,'Maxime Tabatruong');
+INSERT INTO coach VALUES(161,'Meirambek Tatiyev');
+INSERT INTO coach VALUES(162,'Micah Klousia');
+INSERT INTO coach VALUES(163,'Michael Russell');
+INSERT INTO coach VALUES(164,'Michal Navratil');
+INSERT INTO coach VALUES(165,'Miguel Pastura');
+INSERT INTO coach VALUES(166,'Miguel Sanchez');
+INSERT INTO coach VALUES(167,'Mikhail Bril');
+INSERT INTO coach VALUES(168,'Miro Hrvatin');
+INSERT INTO coach VALUES(169,'Morgan Phillips');
+INSERT INTO coach VALUES(170,'Neville Godwin');
+INSERT INTO coach VALUES(171,'Nick Bybel');
+INSERT INTO coach VALUES(172,'Nicola Ceragioli');
+INSERT INTO coach VALUES(173,'Nicolas Copin');
+INSERT INTO coach VALUES(174,'Nicolas Massu');
+INSERT INTO coach VALUES(175,'Nicolas Pastor');
+INSERT INTO coach VALUES(176,'Nishanth Basavareddy');
+INSERT INTO coach VALUES(177,'Nuno Lencastre');
+INSERT INTO coach VALUES(178,'Olivier Coyras');
+INSERT INTO coach VALUES(179,'Olivier Malcor');
+INSERT INTO coach VALUES(180,'Oscar Burrieza');
+INSERT INTO coach VALUES(181,'Oscar Martinez');
+INSERT INTO coach VALUES(182,'Oscar Serrano');
+INSERT INTO coach VALUES(183,'Pablo Cuevas');
+INSERT INTO coach VALUES(184,'Pablo Fuentes');
+INSERT INTO coach VALUES(185,'Paolo Moretti');
+INSERT INTO coach VALUES(186,'Patricio Heras');
+INSERT INTO coach VALUES(187,'Patrick Hirscht');
+INSERT INTO coach VALUES(188,'Patrick McCabe');
+INSERT INTO coach VALUES(189,'Paul Annacone');
+INSERT INTO coach VALUES(190,'Pedro Clar');
+INSERT INTO coach VALUES(191,'Pedro Sousa');
+INSERT INTO coach VALUES(192,'Petar Popovic');
+INSERT INTO coach VALUES(193,'Peter Lucassen');
+INSERT INTO coach VALUES(194,'Peyre Guillaume');
+INSERT INTO coach VALUES(195,'Philip Bester');
+INSERT INTO coach VALUES(196,'Philippe Cassiers');
+INSERT INTO coach VALUES(197,'Rhyne Williams');
+INSERT INTO coach VALUES(198,'Ricardo Ojeda Lara');
+INSERT INTO coach VALUES(199,'Robby Ginepri');
+INSERT INTO coach VALUES(200,'Roberto Tarpani');
+INSERT INTO coach VALUES(201,'Rohan Williams');
+INSERT INTO coach VALUES(202,'Ruan Roelofse');
+INSERT INTO coach VALUES(203,'Ruben Ramirez-Hidalgo');
+INSERT INTO coach VALUES(204,'Rui Machado');
+INSERT INTO coach VALUES(205,'Ryan Harrison');
+INSERT INTO coach VALUES(206,'Ryan Keckley');
+INSERT INTO coach VALUES(207,'Sam Sumyk');
+INSERT INTO coach VALUES(208,'Samuel Lopez');
+INSERT INTO coach VALUES(209,'Santos Galan');
+INSERT INTO coach VALUES(210,'Sascha Nensel');
+INSERT INTO coach VALUES(211,'SebastiAn GutiArrez');
+INSERT INTO coach VALUES(212,'Sebastian Gutierrez');
+INSERT INTO coach VALUES(213,'Serge Arseneault');
+INSERT INTO coach VALUES(214,'Simone Tartarini');
+INSERT INTO coach VALUES(215,'Simone Vagnozzi');
+INSERT INTO coach VALUES(216,'Stefan Rettl');
+INSERT INTO coach VALUES(217,'Stefane Robert');
+INSERT INTO coach VALUES(218,'Stefano Cobolli');
+INSERT INTO coach VALUES(219,'Steve Darcis');
+INSERT INTO coach VALUES(220,'Stuart Havelock');
+INSERT INTO coach VALUES(221,'Thierry Tulasne');
+INSERT INTO coach VALUES(222,'Thomas Blake');
+INSERT INTO coach VALUES(223,'Thomas Johansson');
+INSERT INTO coach VALUES(224,'Toby Smith');
+INSERT INTO coach VALUES(225,'Todd Langman');
+INSERT INTO coach VALUES(226,'Todd Ley');
+INSERT INTO coach VALUES(227,'Tomas Josefus');
+INSERT INTO coach VALUES(228,'Tomeu Salva');
+INSERT INTO coach VALUES(229,'Tommaso Castagnola');
+INSERT INTO coach VALUES(230,'Ty Tucker');
+INSERT INTO coach VALUES(231,'Umberto Rianna');
+INSERT INTO coach VALUES(232,'Vedran Martic');
+INSERT INTO coach VALUES(233,'Viktor Troicki');
+INSERT INTO coach VALUES(234,'Vilim Visak');
+INSERT INTO coach VALUES(235,'Vittaya Samrej');
+INSERT INTO coach VALUES(236,'Wally Masur');
+INSERT INTO coach VALUES(237,'Wayne Arthurs');
+INSERT INTO coach VALUES(238,'Wayne Ferreira');
+INSERT INTO coach VALUES(239,'Werapath Sirijariyaporn');
+INSERT INTO coach VALUES(240,'Wolfgang Thiem');
+INSERT INTO coach VALUES(241,'Xavier Pujo');
+INSERT INTO coach VALUES(242,'Yannik Steinegger');
+INSERT INTO coach VALUES(243,'Yen-Hsun Lu');
+INSERT INTO coach VALUES(244,'Younes El Aynaoui');
+-- near-duplicate names for Task 3 (typo, swapped letters, swapped word order)
+INSERT INTO coach (coach_id, coach_full_name) VALUES
+ (245, 'Adam Kelner'),    -- missing letter
+ (246, 'Adam Keller'),    -- one letter changed
+ (247, 'Kellner Adam'),   -- swapped word order
+ (248, 'Adam Kellnre'),   -- swapped letters
+ (249, 'Adan Kellner');   -- one letter changed
+
+-- load player rows
+INSERT INTO player VALUES('A0E2','Carlos Alcaraz','Carlos Alcaraz','M','2003-05-05',54,74,183,2018,'R','2H');
+INSERT INTO player VALUES('A0FC','Matteo Arnaldi','Matteo Arnaldi','M','2001-02-22',116,71,185,2019,'R','2H');
+INSERT INTO player VALUES('A0GC','Terence Atmane','Terence Atmane','M','2002-01-09',81,80,193,NULL,'L','2H');
+INSERT INTO player VALUES('A0K3','Nicolas Arseneault','Nicolas Arseneault','M','2007-01-18',31,77,183,NULL,'L','2H');
+INSERT INTO player VALUES('AE14','Daniel Altmaier','Daniel Altmaier','M','1998-09-12',99,80,188,2014,'R','1H');
+INSERT INTO player VALUES('AG37','Felix Auger-Aliassime','Felix Auger-Aliassime','M','2000-08-08',29,88,193,2017,'R','2H');
+INSERT INTO player VALUES('B0BI','Sebastian Baez','Sebastian Baez','M','2000-12-28',2,70,170,2018,'R','2H');
+INSERT INTO player VALUES('B0CD','Jenson Brooksby','Jenson Brooksby','M','2000-10-26',180,86,193,2021,'R','2H');
+INSERT INTO player VALUES('B0EJ','Tristan Boyer','Tristan Boyer','M','2001-04-21',156,84,188,NULL,'R','2H');
+INSERT INTO player VALUES('B0FV','Roman Andres Burruchaga','Roman Andres Burruchaga','M','2002-01-23',2,80,183,NULL,'R','2H');
+INSERT INTO player VALUES('B0GG','Mattia Bellucci','Mattia Bellucci','M','2001-06-01',108,77,175,NULL,'L','2H');
+INSERT INTO player VALUES('B0ID','Ignacio Buse','Ignacio Buse','M','2004-03-25',131,78,183,NULL,'R','2H');
+INSERT INTO player VALUES('B0NN','Nishesh Basavareddy','Nishesh Basavareddy','M','2005-05-02',174,73,180,NULL,'R','2H');
+INSERT INTO player VALUES('B0NO','Darwin Blanch','Darwin Blanch','M','2007-09-28',158,83,185,NULL,'L','2H');
+INSERT INTO player VALUES('B0PG','Alexander Blockx','Alexander Blockx','M','2005-04-08',17,83,193,NULL,'R','2H');
+INSERT INTO player VALUES('BD06','Roberto Bautista Agut','Roberto Bautista Agut','M','1988-04-14',53,75,183,2005,'R','2H');
+INSERT INTO player VALUES('BF23','Facundo Bagnis','Facundo Bagnis','M','1990-02-27',6,82,183,2008,'L','2H');
+INSERT INTO player VALUES('BG23','Nikoloz Basilashvili','Nikoloz Basilashvili','M','1992-02-23',95,79,185,2008,'R','2H');
+INSERT INTO player VALUES('BI81','Alex Bolt','Alex Bolt','M','1993-01-05',12,71,183,2011,'L','2H');
+INSERT INTO player VALUES('BK40','Matteo Berrettini','Matteo Berrettini','M','1996-04-12',114,95,196,2015,'R','2H');
+INSERT INTO player VALUES('BK92','Alexander Bublik','Alexander Bublik','M','1997-06-17',141,82,196,2016,'R','2H');
+INSERT INTO player VALUES('BM95','Benjamin Bonzi','Benjamin Bonzi','M','1996-06-09',74,82,183,2015,'R','2H');
+INSERT INTO player VALUES('BS86','Tomas Barrios Vera','Tomas Barrios Vera','M','1997-12-10',34,88,191,2019,'R','2H');
+INSERT INTO player VALUES('BT72','Nuno Borges','Nuno Borges','M','1997-02-19',136,78,185,2019,'R','2H');
+INSERT INTO player VALUES('BU13','Zizou Bergs','Zizou Bergs','M','1999-06-03',19,88,185,2018,'R','2H');
+INSERT INTO player VALUES('BV16','Ugo Blanchet','Ugo Blanchet','M','1999-01-05',80,71,175,NULL,'R','2H');
+INSERT INTO player VALUES('C0AK','Oliver Crawford','Oliver Crawford','M','1999-04-30',182,82,180,2020,'R','2H');
+INSERT INTO player VALUES('C0AU','Francisco Cerundolo','Francisco Cerundolo','M','1998-08-13',2,80,185,2018,'R','2H');
+INSERT INTO player VALUES('C0C8','Juan Manuel Cerundolo','Juan Manuel Cerundolo','M','2001-11-15',2,75,183,2018,'L','2H');
+INSERT INTO player VALUES('C0DF','Francisco Comesana','Francisco Comesana','M','2000-10-06',4,72,178,NULL,'R','2H');
+INSERT INTO player VALUES('C0E9','Flavio Cobolli','Flavio Cobolli','M','2002-05-06',110,74,183,2020,'R','2H');
+INSERT INTO player VALUES('C0H0','Arthur Cazaux','Arthur Cazaux','M','2002-08-23',71,73,183,2020,'R','2H');
+INSERT INTO player VALUES('C0JP','Raphael Collignon','Raphael Collignon','M','2002-01-13',178,86,191,NULL,'R','2H');
+INSERT INTO player VALUES('C0NB','Federico Cina','Federico Cina','M','2007-03-30',111,73,185,NULL,'R','2H');
+INSERT INTO player VALUES('C977','Marin Cilic','Marin Cilic','M','1988-09-28',21,89,198,2005,'R','2H');
+INSERT INTO player VALUES('CD85','Pablo Carreno Busta','Pablo Carreno Busta','M','1991-07-12',55,78,188,2009,'R','2H');
+INSERT INTO player VALUES('CE77','Federico Coria','Federico Coria','M','1992-03-09',6,73,180,2010,'R','2H');
+INSERT INTO player VALUES('CF59','Roberto Carballes Baena','Roberto Carballes Baena','M','1993-03-23',60,77,183,2011,'R','2H');
+INSERT INTO player VALUES('CG80','Borna Coric','Borna Coric','M','1996-11-14',42,85,188,2013,'R','2H');
+INSERT INTO player VALUES('CI14','Jay Clarke','Jay Clarke','M','1998-07-27',86,83,183,2016,'R','2H');
+INSERT INTO player VALUES('D0C1','Jesper de Jong','Jesper de Jong','M','2000-05-31',128,70,180,NULL,'R','2H');
+INSERT INTO player VALUES('D0CG','Facundo Diaz Acosta','Facundo Diaz Acosta','M','2000-12-15',2,75,183,2018,'L','2H');
+INSERT INTO player VALUES('D0CO','Jack Draper','Jack Draper','M','2001-12-22',92,85,193,2018,'L','2H');
+INSERT INTO player VALUES('D0D4','Stefan Dostanic','Stefan Dostanic','M','2001-11-04',167,79,188,NULL,'R','2H');
+INSERT INTO player VALUES('D0DP','Liam Draxl','Liam Draxl','M','2001-12-05',30,79,185,NULL,'R','2H');
+INSERT INTO player VALUES('D0DT','Martin Damm','Martin Damm','M','2003-09-30',159,95,203,NULL,'L','2H');
+INSERT INTO player VALUES('D0F6','Gabriel Diallo','Gabriel Diallo','M','2001-09-24',29,90,203,2023,'R','2H');
+INSERT INTO player VALUES('D0FJ','Luciano Darderi','Luciano Darderi','M','2002-02-14',7,82,183,NULL,'R','2H');
+INSERT INTO player VALUES('D643','Novak Djokovic','Novak Djokovic','M','1987-05-22',145,77,188,2003,'R','2H');
+INSERT INTO player VALUES('D875','Grigor Dimitrov','Grigor Dimitrov','M','1991-05-16',27,81,191,2008,'R','1H');
+INSERT INTO player VALUES('D923','Damir Dzumhur','Damir Dzumhur','M','1992-05-20',22,68,175,2011,'R','2H');
+INSERT INTO player VALUES('D994','James Duckworth','James Duckworth','M','1992-01-21',14,82,183,2010,'R','2H');
+INSERT INTO player VALUES('DA31','Hugo Dellien','Hugo Dellien','M','1993-06-16',23,75,180,2009,'R','2H');
+INSERT INTO player VALUES('DA81','Taro Daniel','Taro Daniel','M','1993-01-27',172,84,191,2010,'R','2H');
+INSERT INTO player VALUES('DB63','Laslo Djere','Laslo Djere','M','1995-06-02',147,82,188,2013,'R','2H');
+INSERT INTO player VALUES('DF88','Aziz Dougaz','Aziz Dougaz','M','1997-03-26',155,82,188,2020,'L','2H');
+INSERT INTO player VALUES('DH50','Alejandro Davidovich Fokina','Alejandro Davidovich Fokina','M','1999-06-05',58,80,180,2017,'R','2H');
+INSERT INTO player VALUES('DH58','Alex de Minaur','Alex de Minaur','M','1999-02-17',14,69,183,2015,'R','2H');
+INSERT INTO player VALUES('E687','Daniel Evans','Daniel Evans','M','1990-05-23',85,75,175,2006,'R','1H');
+INSERT INTO player VALUES('E865','Christopher Eubanks','Christopher Eubanks','M','1996-05-05',157,82,201,2017,'R','1H');
+INSERT INTO player VALUES('EA24','Tomas Martin Etcheverry','Tomas Martin Etcheverry','M','1999-07-18',3,82,196,2017,'R','2H');
+INSERT INTO player VALUES('F0BY','Jacob Fearnley','Jacob Fearnley','M','2001-07-15',94,80,183,NULL,'R','2H');
+INSERT INTO player VALUES('F0DM','Arthur Fery','Arthur Fery','M','2002-07-12',79,76,175,NULL,'R','2H');
+INSERT INTO player VALUES('F0F1','Arthur Fils','Arthur Fils','M','2004-06-12',65,83,185,2021,'R','2H');
+INSERT INTO player VALUES('F0F2','Jaime Faria','Jaime Faria','M','2003-08-06',135,78,188,NULL,'R',NULL);
+INSERT INTO player VALUES('F0FV','Joao Fonseca','Joao Fonseca','M','2006-08-21',26,81,188,NULL,'R','2H');
+INSERT INTO player VALUES('F510','Fabio Fognini','Fabio Fognini','M','1987-05-24',116,79,178,2004,'R','2H');
+INSERT INTO player VALUES('F724','Marton Fucsovics','Marton Fucsovics','M','1992-02-08',106,82,188,2010,'R','2H');
+INSERT INTO player VALUES('FA43','Juan Pablo Ficovich','Juan Pablo Ficovich','M','1997-01-24',2,80,188,2015,'R','2H');
+INSERT INTO player VALUES('FB98','Taylor Fritz','Taylor Fritz','M','1997-10-28',177,86,196,2015,'R','2H');
+INSERT INTO player VALUES('G09O','Hugo Gaston','Hugo Gaston','M','2000-09-26',84,68,173,2018,'L','2H');
+INSERT INTO player VALUES('G0FW','Vilius Gaubas','Vilius Gaubas','M','2004-12-29',125,72,178,NULL,'R','2H');
+INSERT INTO player VALUES('G0GD','Matteo Gigante','Matteo Gigante','M','2002-01-04',114,68,180,NULL,'L','2H');
+INSERT INTO player VALUES('G628','Richard Gasquet','Richard Gasquet','M','1986-06-18',64,79,183,2002,'R','1H');
+INSERT INTO player VALUES('GB88','David Goffin','David Goffin','M','1990-12-07',20,70,180,2009,'R','2H');
+INSERT INTO player VALUES('GC88','Marcos Giron','Marcos Giron','M','1993-07-24',184,77,180,2014,'R','2H');
+INSERT INTO player VALUES('GD64','Cristian Garin','Cristian Garin','M','1996-05-30',35,85,185,2011,'R','2H');
+INSERT INTO player VALUES('GE33','Daniel Elahi Galan','Daniel Elahi Galan','M','1996-06-18',40,72,191,2015,'R','2H');
+INSERT INTO player VALUES('GH92','Borna Gojo','Borna Gojo','M','1998-02-27',41,90,196,2020,'R','2H');
+INSERT INTO player VALUES('GJ16','Federico Agustin Gomez','Federico Agustin Gomez','M','1996-11-26',5,95,191,NULL,'R','2H');
+INSERT INTO player VALUES('GJ37','Tallon Griekspoor','Tallon Griekspoor','M','1996-07-02',128,85,188,2015,'R','2H');
+INSERT INTO player VALUES('GK06','Alexis Galarneau','Alexis Galarneau','M','1999-03-02',28,79,180,NULL,'R','2H');
+INSERT INTO player VALUES('H09N','August Holmgren','August Holmgren','M','1998-04-22',49,84,188,2022,'R','1H');
+INSERT INTO player VALUES('H09P','Brandon Holt','Brandon Holt','M','1998-04-06',179,82,185,2020,'R','2H');
+INSERT INTO player VALUES('H0BH','Rinky Hijikata','Rinky Hijikata','M','2001-02-23',14,72,178,2021,'R','2H');
+INSERT INTO player VALUES('H996','Pierre-Hugues Herbert','Pierre-Hugues Herbert','M','1991-03-18',82,75,188,2010,'R','2H');
+INSERT INTO player VALUES('H997','Yannick Hanfmann','Yannick Hanfmann','M','1991-11-13',98,86,193,2015,'R','2H');
+INSERT INTO player VALUES('HB64','Quentin Halys','Quentin Halys','M','1996-10-26',66,85,191,2012,'R','2H');
+INSERT INTO player VALUES('HB71','Hubert Hurkacz','Hubert Hurkacz','M','1997-02-11',134,81,196,2015,'R','2H');
+INSERT INTO player VALUES('HD68','Billy Harris','Billy Harris','M','1995-01-25',90,89,193,NULL,'R','2H');
+INSERT INTO player VALUES('HF80','Hady Habib','Hady Habib','M','1998-08-21',164,88,188,NULL,'R','2H');
+INSERT INTO player VALUES('HG86','Lloyd Harris','Lloyd Harris','M','1997-02-24',139,80,193,2015,'R','2H');
+INSERT INTO player VALUES('HG94','Benjamin Hassan','Benjamin Hassan','M','1995-02-04',100,85,183,NULL,'R','2H');
+INSERT INTO player VALUES('HH26','Ugo Humbert','Ugo Humbert','M','1998-06-26',70,73,188,2016,'L','2H');
+INSERT INTO player VALUES('J0AZ','Kyrian Jacquet','Kyrian Jacquet','M','2001-05-11',69,71,175,NULL,'R','2H');
+INSERT INTO player VALUES('J551','Nicolas Jarry','Nicolas Jarry','M','1995-10-11',35,90,201,2014,'R','2H');
+INSERT INTO player VALUES('J553','Omar Jasika','Omar Jasika','M','1997-05-18',11,60,183,NULL,'L','2H');
+INSERT INTO player VALUES('K09F','Pavel Kotov','Pavel Kotov','M','1998-11-18',142,89,191,2016,'R','2H');
+INSERT INTO player VALUES('K0A3','Patrick Kypson','Patrick Kypson','M','1999-10-28',160,82,188,2019,'R','2H');
+INSERT INTO player VALUES('K0AH','Sebastian Korda','Sebastian Korda','M','2000-07-05',159,82,196,2018,'R','2H');
+INSERT INTO player VALUES('K0AZ','Aleksandar Kovacevic','Aleksandar Kovacevic','M','1998-08-29',172,79,183,2021,'R','1H');
+INSERT INTO player VALUES('K0EP','Jerome Kym','Jerome Kym','M','2003-02-12',151,87,198,2019,'R','2H');
+INSERT INTO player VALUES('KC12','Mitchell Krueger','Mitchell Krueger','M','1994-01-12',161,82,188,2012,'R','2H');
+INSERT INTO player VALUES('KD46','Thanasi Kokkinakis','Thanasi Kokkinakis','M','1996-04-10',8,84,193,2013,'R','2H');
+INSERT INTO player VALUES('KE17','Nick Kyrgios','Nick Kyrgios','M','1995-04-27',10,85,193,2013,'R','2H');
+INSERT INTO player VALUES('KE29','Karen Khachanov','Karen Khachanov','M','1996-05-21',142,87,198,2013,'R','2H');
+INSERT INTO player VALUES('KE73','Dominik Koepfer','Dominik Koepfer','M','1994-04-29',96,79,180,2016,'L','2H');
+INSERT INTO player VALUES('KI63','Lukas Klein','Lukas Klein','M','1998-03-22',152,85,193,NULL,'R',NULL);
+INSERT INTO player VALUES('KI82','Vit Kopriva','Vit Kopriva','M','1997-06-15',44,69,178,2015,'R','2H');
+INSERT INTO player VALUES('KI95','Miomir Kecmanovic','Miomir Kecmanovic','M','1999-08-31',145,75,183,2017,'R','2H');
+INSERT INTO player VALUES('L0BV','Jiri Lehecka','Jiri Lehecka','M','2001-11-08',45,81,185,2020,'R','2H');
+INSERT INTO player VALUES('L0CF','George Loffhagen','George Loffhagen','M','2001-04-19',89,83,188,NULL,'R','2H');
+INSERT INTO player VALUES('L0CX','Pablo Llamas Ruiz','Pablo Llamas Ruiz','M','2002-10-13',56,80,188,NULL,'R','2H');
+INSERT INTO player VALUES('L0IL','Martin Landaluce','Martin Landaluce','M','2006-01-08',57,80,193,NULL,'R','2H');
+INSERT INTO player VALUES('L987','Dusan Lajovic','Dusan Lajovic','M','1990-06-30',145,83,183,2007,'R','1H');
+INSERT INTO player VALUES('M0C2','Dan Martin','Dan Martin','M','1999-05-09',138,70,175,NULL,'R','1H');
+INSERT INTO player VALUES('M0CI','Fabian Marozsan','Fabian Marozsan','M','1999-10-08',105,75,193,2017,'R','2H');
+INSERT INTO player VALUES('M0EJ','Lorenzo Musetti','Lorenzo Musetti','M','2002-03-03',109,78,185,2019,'R','1H');
+INSERT INTO player VALUES('M0FH','Tomas Machac','Tomas Machac','M','2000-10-13',43,74,183,2017,'R','2H');
+INSERT INTO player VALUES('M0G4','Harold Mayot','Harold Mayot','M','2002-02-04',70,80,180,2020,'R','2H');
+INSERT INTO player VALUES('M0GZ','Giovanni Mpetshi Perricard','Giovanni Mpetshi Perricard','M','2003-07-08',69,98,203,2021,'R','1H');
+INSERT INTO player VALUES('M0HU','Shintaro Mochizuki','Shintaro Mochizuki','M','2003-06-02',118,70,175,2019,'R','2H');
+INSERT INTO player VALUES('M0JF','Hamad Medjedovic','Hamad Medjedovic','M','2003-07-18',146,86,188,2021,'R','2H');
+INSERT INTO player VALUES('M0JZ','Filip Misolic','Filip Misolic','M','2001-08-08',16,75,180,2019,'R','2H');
+INSERT INTO player VALUES('M0K4','Elmer Moller','Elmer Moller','M','2003-07-09',48,73,183,NULL,'R','2H');
+INSERT INTO player VALUES('M0NI','Jakub Mensik','Jakub Mensik','M','2005-09-01',47,87,196,2022,'R','2H');
+INSERT INTO player VALUES('M0ON','Johannus Monday','Johannus Monday','M','2002-01-22',87,86,198,NULL,'L','2H');
+INSERT INTO player VALUES('M0OQ','James McCabe','James McCabe','M','2003-07-05',132,82,188,NULL,'R','2H');
+INSERT INTO player VALUES('M0QI','Alex Michelsen','Alex Michelsen','M','2004-08-25',169,79,193,2023,'R','2H');
+INSERT INTO player VALUES('MC65','Gael Monfils','Gael Monfils','M','1986-09-01',75,85,193,2004,'R','2H');
+INSERT INTO player VALUES('ME82','Adrian Mannarino','Adrian Mannarino','M','1988-06-29',83,79,180,2004,'L','2H');
+INSERT INTO player VALUES('MJ08','Thiago Monteiro','Thiago Monteiro','M','1994-05-31',24,78,183,2011,'L','2H');
+INSERT INTO player VALUES('MK66','Mackenzie McDonald','Mackenzie McDonald','M','1995-04-16',176,73,178,2016,'R','2H');
+INSERT INTO player VALUES('MM58','Daniil Medvedev','Daniil Medvedev','M','1996-02-11',142,83,198,2014,'R','2H');
+INSERT INTO player VALUES('MN13','Maximilian Marterer','Maximilian Marterer','M','1995-06-15',101,78,188,2015,'L','2H');
+INSERT INTO player VALUES('MO44','Pedro Martinez','Pedro Martinez','M','1997-04-26',51,76,185,2016,'R','2H');
+INSERT INTO player VALUES('MP20','Alexandre Muller','Alexandre Muller','M','1997-02-01',76,75,183,2014,'R','2H');
+INSERT INTO player VALUES('MQ75','Kamil Majchrzak','Kamil Majchrzak','M','1996-01-13',133,80,183,2013,'R','2H');
+INSERT INTO player VALUES('MU94','Jaume Munar','Jaume Munar','M','1997-05-05',59,76,183,2014,'R','2H');
+INSERT INTO player VALUES('MW02','Corentin Moutet','Corentin Moutet','M','1999-04-19',75,71,180,2016,'L','2H');
+INSERT INTO player VALUES('MW18','Nicolas Moreno De Alboran','Nicolas Moreno De Alboran','M','1997-07-14',172,82,185,2019,'R','2H');
+INSERT INTO player VALUES('N0AE','Brandon Nakashima','Brandon Nakashima','M','2001-08-03',181,83,188,2019,'R','2H');
+INSERT INTO player VALUES('N0AM','Emilio Nava','Emilio Nava','M','2001-12-02',186,79,185,2018,'R','2H');
+INSERT INTO player VALUES('N0BG','Luca Nardi','Luca Nardi','M','2003-08-06',113,80,185,NULL,'R','2H');
+INSERT INTO player VALUES('N0BS','Mariano Navone','Mariano Navone','M','2001-02-27',1,73,178,NULL,'R','2H');
+INSERT INTO player VALUES('N552','Kei Nishikori','Kei Nishikori','M','1989-12-29',123,73,178,2007,'R','2H');
+INSERT INTO player VALUES('N732','Yoshihito Nishioka','Yoshihito Nishioka','M','1995-09-27',119,64,170,2014,'L','2H');
+INSERT INTO player VALUES('N771','Cameron Norrie','Cameron Norrie','M','1995-08-23',140,82,188,2017,'L','2H');
+INSERT INTO player VALUES('N897','Sumit Nagal','Sumit Nagal','M','1997-08-16',107,69,178,2015,'R','2H');
+INSERT INTO player VALUES('O0A2','Gauthier Onclin','Gauthier Onclin','M','2001-02-26',18,77,180,NULL,'R','2H');
+INSERT INTO player VALUES('O483','Christopher O''Connell','Christopher O''Connell','M','1994-06-03',14,78,183,2011,'R','1H');
+INSERT INTO player VALUES('O513','Sebastian Ofner','Sebastian Ofner','M','1996-05-12',15,81,191,2015,'R','2H');
+INSERT INTO player VALUES('O522','Reilly Opelka','Reilly Opelka','M','1997-08-28',183,102,211,2015,'R','2H');
+INSERT INTO player VALUES('P09O','Zsombor Piros','Zsombor Piros','M','1999-10-13',105,68,180,2016,'R','2H');
+INSERT INTO player VALUES('P09Z','Alexei Popyrin','Alexei Popyrin','M','1999-08-05',14,78,196,2017,'R','2H');
+INSERT INTO player VALUES('P0CT','Francesco Passaro','Francesco Passaro','M','2001-01-07',112,83,180,2019,'R','2H');
+INSERT INTO player VALUES('P0HT','Jack Pinnington Jones','Jack Pinnington Jones','M','2003-03-30',88,82,180,NULL,'R','2H');
+INSERT INTO player VALUES('P0HW','Dino Prizmic','Dino Prizmic','M','2005-08-05',41,80,188,NULL,'R','2H');
+INSERT INTO player VALUES('PD07','Vasek Pospisil','Vasek Pospisil','M','1990-06-23',33,88,193,2007,'R','2H');
+INSERT INTO player VALUES('PF39','Lucas Pouille','Lucas Pouille','M','1994-02-23',68,84,185,2012,'R','2H');
+INSERT INTO player VALUES('PL56','Tommy Paul','Tommy Paul','M','1997-05-17',185,82,185,2015,'R','2H');
+INSERT INTO player VALUES('Q02L','Ethan Quinn','Ethan Quinn','M','2004-03-12',162,82,191,2023,'R','2H');
+INSERT INTO player VALUES('R0DG','Holger Rune','Holger Rune','M','2003-04-29',50,77,188,2020,'R','2H');
+INSERT INTO player VALUES('R0E0','Chris Rodesch','Chris Rodesch','M','2001-07-18',126,93,198,NULL,'R','2H');
+INSERT INTO player VALUES('R0EB','Valentin Royer','Valentin Royer','M','2001-05-29',73,86,188,NULL,'R','2H');
+INSERT INTO player VALUES('R0FS','Leandro Riedi','Leandro Riedi','M','2002-01-27',148,78,191,NULL,'R','2H');
+INSERT INTO player VALUES('R0GO','Henrique Rocha','Henrique Rocha','M','2004-04-06',137,83,180,NULL,'R','2H');
+INSERT INTO player VALUES('R772','Albert Ramos-Vinolas','Albert Ramos-Vinolas','M','1988-01-17',52,76,188,2007,'L','2H');
+INSERT INTO player VALUES('RC91','Arthur Rinderknech','Arthur Rinderknech','M','1995-07-23',67,88,196,2018,'R','2H');
+INSERT INTO player VALUES('RE44','Andrey Rublev','Andrey Rublev','M','1997-10-20',142,75,188,2014,'R','2H');
+INSERT INTO player VALUES('RH16','Casper Ruud','Casper Ruud','M','1998-12-22',130,81,183,2015,'R','2H');
+INSERT INTO player VALUES('RH24','Emil Ruusuvuori','Emil Ruusuvuori','M','1999-04-02',62,79,188,2018,'R','2H');
+INSERT INTO player VALUES('S0AG','Jannik Sinner','Jannik Sinner','M','2001-08-16',115,77,191,2018,'R','2H');
+INSERT INTO player VALUES('S0GD','Dalibor Svrcina','Dalibor Svrcina','M','2002-10-02',46,68,178,NULL,'R','2H');
+INSERT INTO player VALUES('S0H2','Alexander Shevchenko','Alexander Shevchenko','M','2000-11-29',144,80,188,2018,'R','2H');
+INSERT INTO player VALUES('S0HR','Kasidit Samrej','Kasidit Samrej','M','2001-01-20',153,91,191,NULL,'R','2H');
+INSERT INTO player VALUES('S0JA','Eliot Spizzirri','Eliot Spizzirri','M','2001-12-23',163,79,185,NULL,'R','2H');
+INSERT INTO player VALUES('S0K7','Zachary Svajda','Zachary Svajda','M','2002-11-29',168,70,175,2019,'R','2H');
+INSERT INTO player VALUES('S0LA','Dominic Stricker','Dominic Stricker','M','2002-08-16',149,80,183,2020,'L','2H');
+INSERT INTO player VALUES('S0N0','Tristan Schoolkate','Tristan Schoolkate','M','2001-02-26',13,83,183,NULL,'R','2H');
+INSERT INTO player VALUES('S0RE','Juncheng Shang','Juncheng Shang','M','2005-02-02',36,73,180,2021,'L','2H');
+INSERT INTO player VALUES('S0S1','Ben Shelton','Ben Shelton','M','2002-10-09',157,88,193,2022,'L','2H');
+INSERT INTO player VALUES('S0TX','Henry Searle','Henry Searle','M','2006-03-29',93,85,193,NULL,'L','2H');
+INSERT INTO player VALUES('S0UV','Rei Sakamoto','Rei Sakamoto','M','2006-06-24',120,80,193,NULL,'R','2H');
+INSERT INTO player VALUES('S0ZE','Colton Smith','Colton Smith','M','2003-03-05',175,77,183,NULL,'R','2H');
+INSERT INTO player VALUES('SL28','Jan-Lennard Struff','Jan-Lennard Struff','M','1990-04-25',102,92,193,2009,'R','2H');
+INSERT INTO player VALUES('SU55','Denis Shapovalov','Denis Shapovalov','M','1999-04-15',NULL,75,185,2017,'L','1H');
+INSERT INTO player VALUES('SU87','Lorenzo Sonego','Lorenzo Sonego','M','1995-05-11',117,76,191,2013,'R','2H');
+INSERT INTO player VALUES('SX50','Roman Safiullin','Roman Safiullin','M','1997-08-07',143,75,185,2015,'R','2H');
+INSERT INTO player VALUES('SX91','Thiago Seyboth Wild','Thiago Seyboth Wild','M','2000-03-10',25,80,185,2018,'R','2H');
+INSERT INTO player VALUES('T09X','Clement Tabur','Clement Tabur','M','2000-01-24',77,73,173,NULL,'R','2H');
+INSERT INTO player VALUES('T0A1','Thiago Agustin Tirante','Thiago Agustin Tirante','M','2001-04-10',3,81,185,2016,'R','2H');
+INSERT INTO player VALUES('T0AP','Chun-Hsin Tseng','Chun-Hsin Tseng','M','2001-08-08',154,65,175,2019,'R','2H');
+INSERT INTO player VALUES('T0BW','James Trotter','James Trotter','M','1999-07-29',121,75,183,NULL,'R',NULL);
+INSERT INTO player VALUES('T0GR','Oliver Tarvet','Oliver Tarvet','M','2003-10-29',91,88,185,NULL,'R','2H');
+INSERT INTO player VALUES('T0HA','Learner Tien','Learner Tien','M','2005-12-02',167,73,180,2023,'L','2H');
+INSERT INTO player VALUES('TC01','Li Tu','Li Tu','M','1996-05-27',8,80,183,NULL,'R','1H');
+INSERT INTO player VALUES('TC61','Jordan Thompson','Jordan Thompson','M','1994-04-20',14,82,183,2013,'R','2H');
+INSERT INTO player VALUES('TD51','Frances Tiafoe','Frances Tiafoe','M','1998-01-20',165,86,188,2015,'R','2H');
+INSERT INTO player VALUES('TE16','Carlos Taberner','Carlos Taberner','M','1997-08-08',61,78,183,2015,'R','2H');
+INSERT INTO player VALUES('TE30','Alejandro Tabilo','Alejandro Tabilo','M','1997-06-02',32,75,188,2015,'L','2H');
+INSERT INTO player VALUES('TE51','Stefanos Tsitsipas','Stefanos Tsitsipas','M','1998-08-12',103,90,193,2016,'R','1H');
+INSERT INTO player VALUES('U182','Camilo Ugo Carabelli','Camilo Ugo Carabelli','M','1999-06-17',2,83,185,2016,'R','2H');
+INSERT INTO player VALUES('V0AM','Otto Virtanen','Otto Virtanen','M','2001-06-21',63,82,193,2018,'R','2H');
+INSERT INTO player VALUES('V812','Botic van de Zandschulp','Botic van de Zandschulp','M','1995-10-04',129,85,191,2016,'R','2H');
+INSERT INTO player VALUES('V832','Aleksandar Vukic','Aleksandar Vukic','M','1996-04-06',14,85,188,2018,'R','2H');
+INSERT INTO player VALUES('VA25','Valentin Vacherot','Valentin Vacherot','M','1998-11-16',127,83,193,NULL,'R','2H');
+INSERT INTO player VALUES('W09E','Adam Walton','Adam Walton','M','1999-04-17',9,77,183,2022,'R','2H');
+INSERT INTO player VALUES('W0BH','Coleman Wong','Coleman Wong','M','2004-06-06',104,80,191,NULL,'R','2H');
+INSERT INTO player VALUES('W367','Stan Wawrinka','Stan Wawrinka','M','1985-03-28',150,81,183,2002,'R','1H');
+INSERT INTO player VALUES('WB08','Yosuke Watanuki','Yosuke Watanuki','M','1998-04-12',122,73,180,2016,'R','2H');
+INSERT INTO player VALUES('WB32','Yibing Wu','Yibing Wu','M','1999-10-14',37,80,183,2017,'R','2H');
+INSERT INTO player VALUES('Y09V','Yunchaokete Bu','Yunchaokete Bu','M','2002-01-19',39,82,185,NULL,'R','2H');
+INSERT INTO player VALUES('Z09Z','Beibit Zhukayev','Beibit Zhukayev','M','2000-10-12',124,93,198,NULL,'R','2H');
+INSERT INTO player VALUES('Z0A1','Giulio Zeppieri','Giulio Zeppieri','M','2001-12-07',114,82,183,2019,'L','2H');
+INSERT INTO player VALUES('Z0CQ','Yi Zhou','Yi Zhou','M','2005-03-14',36,85,193,NULL,'R','2H');
+INSERT INTO player VALUES('Z355','Alexander Zverev','Alexander Zverev','M','1997-04-20',97,90,198,2013,'R','2H');
+INSERT INTO player VALUES('Z371','Zhizhen Zhang','Zhizhen Zhang','M','1996-10-16',38,87,193,2012,'R','2H');
+
+-- load tournament_series rows
+INSERT INTO tournament_series VALUES(1,'Australian Open','Grand Slam');
+INSERT INTO tournament_series VALUES(2,'Canada Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(3,'Cincinnati Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(4,'Indian Wells Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(5,'Madrid Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(6,'Miami Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(7,'Monte Carlo Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(8,'Paris Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(9,'Roland Garros','Grand Slam');
+INSERT INTO tournament_series VALUES(10,'Rome Masters','Masters 1000');
+INSERT INTO tournament_series VALUES(11,'Shanghai','Masters 1000');
+INSERT INTO tournament_series VALUES(12,'US Open','Grand Slam');
+INSERT INTO tournament_series VALUES(13,'Wimbledon','Grand Slam');
+
+-- load venue rows
+INSERT INTO venue VALUES(1,'Melbourne Park',11,'Hard');
+INSERT INTO venue VALUES(2,'Indian Wells Tennis Garden',166,'Hard');
+INSERT INTO venue VALUES(3,'Hard Rock Stadium',171,'Hard');
+INSERT INTO venue VALUES(4,'Monte-Carlo Country Club',78,'Clay');
+INSERT INTO venue VALUES(5,'Park Manzanares',57,'Clay');
+INSERT INTO venue VALUES(6,'Foro Italico',114,'Clay');
+INSERT INTO venue VALUES(7,'Stade Roland Garros',75,'Clay');
+INSERT INTO venue VALUES(8,'All England Lawn Tennis and Croquet Club',89,'Grass');
+INSERT INTO venue VALUES(9,'Sobeys Stadium',32,'Hard');
+INSERT INTO venue VALUES(10,'Lindner Family Tennis Center',170,'Hard');
+INSERT INTO venue VALUES(11,'USTA Billie Jean King National Tennis Center',173,'Hard');
+INSERT INTO venue VALUES(12,'Qizhong Forest Sports City Arena',38,'Hard');
+INSERT INTO venue VALUES(13,'Paris La Défense Arena',72,'Hard');
+
+-- load tournament_edition rows
+INSERT INTO tournament_edition VALUES('2025-1536',5,5,'2025-04-21');
+INSERT INTO tournament_edition VALUES('2025-352',8,13,'2025-10-27');
+INSERT INTO tournament_edition VALUES('2025-403',6,3,'2025-03-17');
+INSERT INTO tournament_edition VALUES('2025-404',4,2,'2025-03-03');
+INSERT INTO tournament_edition VALUES('2025-410',7,4,'2025-04-07');
+INSERT INTO tournament_edition VALUES('2025-416',10,6,'2025-05-05');
+INSERT INTO tournament_edition VALUES('2025-421',2,9,'2025-07-27');
+INSERT INTO tournament_edition VALUES('2025-422',3,10,'2025-08-07');
+INSERT INTO tournament_edition VALUES('2025-5014',11,12,'2025-09-24');
+INSERT INTO tournament_edition VALUES('2025-520',9,7,'2025-05-26');
+INSERT INTO tournament_edition VALUES('2025-540',13,8,'2025-06-30');
+INSERT INTO tournament_edition VALUES('2025-560',12,11,'2025-08-24');
+INSERT INTO tournament_edition VALUES('2025-580',1,1,'2025-01-13');
+
+-- load event rows
+INSERT INTO event VALUES(1,'2025-1536','M',96,3);
+INSERT INTO event VALUES(2,'2025-352','M',56,3);
+INSERT INTO event VALUES(3,'2025-403','M',96,3);
+INSERT INTO event VALUES(4,'2025-404','M',96,3);
+INSERT INTO event VALUES(5,'2025-410','M',56,3);
+INSERT INTO event VALUES(6,'2025-416','M',96,3);
+INSERT INTO event VALUES(7,'2025-421','M',96,3);
+INSERT INTO event VALUES(8,'2025-422','M',96,3);
+INSERT INTO event VALUES(9,'2025-5014','M',96,3);
+INSERT INTO event VALUES(10,'2025-520','M',128,5);
+INSERT INTO event VALUES(11,'2025-540','M',128,5);
+INSERT INTO event VALUES(12,'2025-560','M',128,5);
+INSERT INTO event VALUES(13,'2025-580','M',128,5);
+
+-- load player_nationalities rows
+INSERT INTO player_nationalities VALUES('A0E2','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('A0FC','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('A0GC','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('A0K3','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('AE14','GER',2025,NULL);
+INSERT INTO player_nationalities VALUES('AG37','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0BI','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0CD','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0EJ','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0FV','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0GG','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0ID','PER',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0NN','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0NO','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('B0PG','BEL',2025,NULL);
+INSERT INTO player_nationalities VALUES('BD06','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('BF23','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('BG23','GEO',2025,NULL);
+INSERT INTO player_nationalities VALUES('BI81','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('BK40','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('BK92','KAZ',2025,NULL);
+INSERT INTO player_nationalities VALUES('BM95','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('BS86','CHI',2025,NULL);
+INSERT INTO player_nationalities VALUES('BT72','POR',2025,NULL);
+INSERT INTO player_nationalities VALUES('BU13','BEL',2025,NULL);
+INSERT INTO player_nationalities VALUES('BV16','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0AK','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0AU','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0C8','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0DF','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0E9','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0H0','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0JP','BEL',2025,NULL);
+INSERT INTO player_nationalities VALUES('C0NB','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('C977','CRO',2025,NULL);
+INSERT INTO player_nationalities VALUES('CD85','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('CE77','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('CF59','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('CG80','CRO',2025,NULL);
+INSERT INTO player_nationalities VALUES('CI14','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0C1','NED',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0CG','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0CO','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0D4','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0DP','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0DT','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0F6','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('D0FJ','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('D643','SRB',2025,NULL);
+INSERT INTO player_nationalities VALUES('D875','BUL',2025,NULL);
+INSERT INTO player_nationalities VALUES('D923','BIH',2025,NULL);
+INSERT INTO player_nationalities VALUES('D994','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('DA31','BOL',2025,NULL);
+INSERT INTO player_nationalities VALUES('DA81','JPN',2025,NULL);
+INSERT INTO player_nationalities VALUES('DB63','SRB',2025,NULL);
+INSERT INTO player_nationalities VALUES('DF88','TUN',2025,NULL);
+INSERT INTO player_nationalities VALUES('DH50','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('DH58','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('E687','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('E865','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('EA24','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('F0BY','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('F0DM','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('F0F1','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('F0F2','POR',2025,NULL);
+INSERT INTO player_nationalities VALUES('F0FV','BRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('F510','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('F724','HUN',2025,NULL);
+INSERT INTO player_nationalities VALUES('FA43','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('FB98','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('G09O','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('G0FW','LTU',2025,NULL);
+INSERT INTO player_nationalities VALUES('G0GD','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('G628','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('GB88','BEL',2025,NULL);
+INSERT INTO player_nationalities VALUES('GC88','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('GD64','CHI',2025,NULL);
+INSERT INTO player_nationalities VALUES('GE33','COL',2025,NULL);
+INSERT INTO player_nationalities VALUES('GH92','CRO',2025,NULL);
+INSERT INTO player_nationalities VALUES('GJ16','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('GJ37','NED',2025,NULL);
+INSERT INTO player_nationalities VALUES('GK06','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('H09N','DEN',2025,NULL);
+INSERT INTO player_nationalities VALUES('H09P','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('H0BH','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('H996','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('H997','GER',2025,NULL);
+INSERT INTO player_nationalities VALUES('HB64','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('HB71','POL',2025,NULL);
+INSERT INTO player_nationalities VALUES('HD68','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('HF80','LBN',2025,NULL);
+INSERT INTO player_nationalities VALUES('HG86','RSA',2025,NULL);
+INSERT INTO player_nationalities VALUES('HG94','LBN',2025,NULL);
+INSERT INTO player_nationalities VALUES('HH26','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('J0AZ','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('J551','CHI',2025,NULL);
+INSERT INTO player_nationalities VALUES('J553','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('K09F','RUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('K0A3','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('K0AH','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('K0AZ','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('K0EP','SUI',2025,NULL);
+INSERT INTO player_nationalities VALUES('KC12','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('KD46','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('KE17','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('KE29','RUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('KE73','GER',2025,NULL);
+INSERT INTO player_nationalities VALUES('KI63','SVK',2025,NULL);
+INSERT INTO player_nationalities VALUES('KI82','CZE',2025,NULL);
+INSERT INTO player_nationalities VALUES('KI95','SRB',2025,NULL);
+INSERT INTO player_nationalities VALUES('L0BV','CZE',2025,NULL);
+INSERT INTO player_nationalities VALUES('L0CF','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('L0CX','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('L0IL','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('L987','SRB',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0C2','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0CI','HUN',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0EJ','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0FH','CZE',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0G4','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0GZ','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0HU','JPN',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0JF','SRB',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0JZ','AUT',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0K4','DEN',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0NI','CZE',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0ON','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0OQ','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('M0QI','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('MC65','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('ME82','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('MJ08','BRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('MK66','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('MM58','RUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('MN13','GER',2025,NULL);
+INSERT INTO player_nationalities VALUES('MO44','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('MP20','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('MQ75','POL',2025,NULL);
+INSERT INTO player_nationalities VALUES('MU94','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('MW02','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('MW18','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('N0AE','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('N0AM','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('N0BG','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('N0BS','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('N552','JPN',2025,NULL);
+INSERT INTO player_nationalities VALUES('N732','JPN',2025,NULL);
+INSERT INTO player_nationalities VALUES('N771','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('N897','IND',2025,NULL);
+INSERT INTO player_nationalities VALUES('O0A2','BEL',2025,NULL);
+INSERT INTO player_nationalities VALUES('O483','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('O513','AUT',2025,NULL);
+INSERT INTO player_nationalities VALUES('O522','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('P09O','HUN',2025,NULL);
+INSERT INTO player_nationalities VALUES('P09Z','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('P0CT','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('P0HT','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('P0HW','CRO',2025,NULL);
+INSERT INTO player_nationalities VALUES('PD07','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('PF39','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('PL56','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('Q02L','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('R0DG','DEN',2025,NULL);
+INSERT INTO player_nationalities VALUES('R0E0','LUX',2025,NULL);
+INSERT INTO player_nationalities VALUES('R0EB','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('R0FS','SUI',2025,NULL);
+INSERT INTO player_nationalities VALUES('R0GO','POR',2025,NULL);
+INSERT INTO player_nationalities VALUES('R772','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('RC91','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('RE44','RUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('RH16','NOR',2025,NULL);
+INSERT INTO player_nationalities VALUES('RH24','FIN',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0AG','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0GD','CZE',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0H2','KAZ',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0HR','THA',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0JA','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0K7','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0LA','SUI',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0N0','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0RE','CHN',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0S1','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0TX','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0UV','JPN',2025,NULL);
+INSERT INTO player_nationalities VALUES('S0ZE','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('SL28','GER',2025,NULL);
+INSERT INTO player_nationalities VALUES('SU55','CAN',2025,NULL);
+INSERT INTO player_nationalities VALUES('SU87','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('SX50','RUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('SX91','BRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('T09X','FRA',2025,NULL);
+INSERT INTO player_nationalities VALUES('T0A1','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('T0AP','TPE',2025,NULL);
+INSERT INTO player_nationalities VALUES('T0BW','JPN',2025,NULL);
+INSERT INTO player_nationalities VALUES('T0GR','GBR',2025,NULL);
+INSERT INTO player_nationalities VALUES('T0HA','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('TC01','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('TC61','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('TD51','USA',2025,NULL);
+INSERT INTO player_nationalities VALUES('TE16','ESP',2025,NULL);
+INSERT INTO player_nationalities VALUES('TE30','CHI',2025,NULL);
+INSERT INTO player_nationalities VALUES('TE51','GRE',2025,NULL);
+INSERT INTO player_nationalities VALUES('U182','ARG',2025,NULL);
+INSERT INTO player_nationalities VALUES('V0AM','FIN',2025,NULL);
+INSERT INTO player_nationalities VALUES('V812','NED',2025,NULL);
+INSERT INTO player_nationalities VALUES('V832','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('VA25','MON',2025,NULL);
+INSERT INTO player_nationalities VALUES('W09E','AUS',2025,NULL);
+INSERT INTO player_nationalities VALUES('W0BH','HKG',2025,NULL);
+INSERT INTO player_nationalities VALUES('W367','SUI',2025,NULL);
+INSERT INTO player_nationalities VALUES('WB08','JPN',2025,NULL);
+INSERT INTO player_nationalities VALUES('WB32','CHN',2025,NULL);
+INSERT INTO player_nationalities VALUES('Y09V','CHN',2025,NULL);
+INSERT INTO player_nationalities VALUES('Z09Z','KAZ',2025,NULL);
+INSERT INTO player_nationalities VALUES('Z0A1','ITA',2025,NULL);
+INSERT INTO player_nationalities VALUES('Z0CQ','CHN',2025,NULL);
+INSERT INTO player_nationalities VALUES('Z355','GER',2025,NULL);
+INSERT INTO player_nationalities VALUES('Z371','CHN',2025,NULL);
+
+-- load coach_player rows
+INSERT INTO coach_player VALUES('A0E2',124);
+INSERT INTO coach_player VALUES('A0E2',208);
+INSERT INTO coach_player VALUES('A0FC',10);
+INSERT INTO coach_player VALUES('A0FC',159);
+INSERT INTO coach_player VALUES('A0GC',194);
+INSERT INTO coach_player VALUES('A0K3',213);
+INSERT INTO coach_player VALUES('AE14',4);
+INSERT INTO coach_player VALUES('AG37',80);
+INSERT INTO coach_player VALUES('B0BI',212);
+INSERT INTO coach_player VALUES('B0CD',197);
+INSERT INTO coach_player VALUES('B0CD',61);
+INSERT INTO coach_player VALUES('B0EJ',6);
+INSERT INTO coach_player VALUES('B0EJ',144);
+INSERT INTO coach_player VALUES('B0FV',136);
+INSERT INTO coach_player VALUES('B0GG',68);
+INSERT INTO coach_player VALUES('B0GG',185);
+INSERT INTO coach_player VALUES('B0NN',37);
+INSERT INTO coach_player VALUES('B0NN',176);
+INSERT INTO coach_player VALUES('B0NO',76);
+INSERT INTO coach_player VALUES('B0PG',196);
+INSERT INTO coach_player VALUES('BD06',120);
+INSERT INTO coach_player VALUES('BD06',49);
+INSERT INTO coach_player VALUES('BF23',21);
+INSERT INTO coach_player VALUES('BI81',201);
+INSERT INTO coach_player VALUES('BK40',9);
+INSERT INTO coach_player VALUES('BK40',231);
+INSERT INTO coach_player VALUES('BK92',26);
+INSERT INTO coach_player VALUES('BM95',138);
+INSERT INTO coach_player VALUES('BS86',91);
+INSERT INTO coach_player VALUES('BT72',204);
+INSERT INTO coach_player VALUES('BT72',96);
+INSERT INTO coach_player VALUES('BU13',134);
+INSERT INTO coach_player VALUES('BV16',178);
+INSERT INTO coach_player VALUES('C0AK',171);
+INSERT INTO coach_player VALUES('C0AU',175);
+INSERT INTO coach_player VALUES('C0AU',183);
+INSERT INTO coach_player VALUES('C0C8',133);
+INSERT INTO coach_player VALUES('C0DF',211);
+INSERT INTO coach_player VALUES('C0E9',218);
+INSERT INTO coach_player VALUES('C0H0',207);
+INSERT INTO coach_player VALUES('C0JP',219);
+INSERT INTO coach_player VALUES('C0NB',77);
+INSERT INTO coach_player VALUES('C977',234);
+INSERT INTO coach_player VALUES('CD85',208);
+INSERT INTO coach_player VALUES('CD85',117);
+INSERT INTO coach_player VALUES('CE77',38);
+INSERT INTO coach_player VALUES('CF59',122);
+INSERT INTO coach_player VALUES('CG80',78);
+INSERT INTO coach_player VALUES('CI14',25);
+INSERT INTO coach_player VALUES('D0C1',28);
+INSERT INTO coach_player VALUES('D0CG',148);
+INSERT INTO coach_player VALUES('D0CG',147);
+INSERT INTO coach_player VALUES('D0CO',104);
+INSERT INTO coach_player VALUES('D0DT',154);
+INSERT INTO coach_player VALUES('D0DT',162);
+INSERT INTO coach_player VALUES('D0DT',107);
+INSERT INTO coach_player VALUES('D0F6',155);
+INSERT INTO coach_player VALUES('D0FJ',140);
+INSERT INTO coach_player VALUES('D875',105);
+INSERT INTO coach_player VALUES('D875',51);
+INSERT INTO coach_player VALUES('D923',22);
+INSERT INTO coach_player VALUES('D994',237);
+INSERT INTO coach_player VALUES('DA31',17);
+INSERT INTO coach_player VALUES('DB63',150);
+INSERT INTO coach_player VALUES('DH50',73);
+INSERT INTO coach_player VALUES('DH50',56);
+INSERT INTO coach_player VALUES('DH58',3);
+INSERT INTO coach_player VALUES('E865',202);
+INSERT INTO coach_player VALUES('EA24',94);
+INSERT INTO coach_player VALUES('F0BY',224);
+INSERT INTO coach_player VALUES('F0BY',125);
+INSERT INTO coach_player VALUES('F0DM',32);
+INSERT INTO coach_player VALUES('F0F1',100);
+INSERT INTO coach_player VALUES('F0FV',90);
+INSERT INTO coach_player VALUES('F510',75);
+INSERT INTO coach_player VALUES('F724',1);
+INSERT INTO coach_player VALUES('FA43',6);
+INSERT INTO coach_player VALUES('FA43',139);
+INSERT INTO coach_player VALUES('FB98',163);
+INSERT INTO coach_player VALUES('FB98',189);
+INSERT INTO coach_player VALUES('G09O',244);
+INSERT INTO coach_player VALUES('G0GD',145);
+INSERT INTO coach_player VALUES('G628',126);
+INSERT INTO coach_player VALUES('GB88',112);
+INSERT INTO coach_player VALUES('GC88',129);
+INSERT INTO coach_player VALUES('GC88',160);
+INSERT INTO coach_player VALUES('GE33',209);
+INSERT INTO coach_player VALUES('GH92',158);
+INSERT INTO coach_player VALUES('GJ37',58);
+INSERT INTO coach_player VALUES('H09N',114);
+INSERT INTO coach_player VALUES('H09N',206);
+INSERT INTO coach_player VALUES('H0BH',151);
+INSERT INTO coach_player VALUES('H996',113);
+INSERT INTO coach_player VALUES('H997',192);
+INSERT INTO coach_player VALUES('HB64',179);
+INSERT INTO coach_player VALUES('HB71',174);
+INSERT INTO coach_player VALUES('HB71',101);
+INSERT INTO coach_player VALUES('HD68',85);
+INSERT INTO coach_player VALUES('HF80',186);
+INSERT INTO coach_player VALUES('HG86',20);
+INSERT INTO coach_player VALUES('HG94',93);
+INSERT INTO coach_player VALUES('HH26',70);
+INSERT INTO coach_player VALUES('J0AZ',217);
+INSERT INTO coach_player VALUES('J551',41);
+INSERT INTO coach_player VALUES('J551',118);
+INSERT INTO coach_player VALUES('J553',2);
+INSERT INTO coach_player VALUES('K09F',137);
+INSERT INTO coach_player VALUES('K09F',167);
+INSERT INTO coach_player VALUES('K0A3',7);
+INSERT INTO coach_player VALUES('K0AH',156);
+INSERT INTO coach_player VALUES('K0AZ',48);
+INSERT INTO coach_player VALUES('K0EP',152);
+INSERT INTO coach_player VALUES('KC12',47);
+INSERT INTO coach_player VALUES('KD46',225);
+INSERT INTO coach_player VALUES('KD46',226);
+INSERT INTO coach_player VALUES('KE29',119);
+INSERT INTO coach_player VALUES('KE29',232);
+INSERT INTO coach_player VALUES('KE29',66);
+INSERT INTO coach_player VALUES('KE73',197);
+INSERT INTO coach_player VALUES('KE73',33);
+INSERT INTO coach_player VALUES('KI63',128);
+INSERT INTO coach_player VALUES('KI82',108);
+INSERT INTO coach_player VALUES('KI95',233);
+INSERT INTO coach_player VALUES('L0BV',164);
+INSERT INTO coach_player VALUES('L0CX',182);
+INSERT INTO coach_player VALUES('L0IL',180);
+INSERT INTO coach_player VALUES('L0IL',65);
+INSERT INTO coach_player VALUES('L0IL',228);
+INSERT INTO coach_player VALUES('L987',123);
+INSERT INTO coach_player VALUES('M0CI',92);
+INSERT INTO coach_player VALUES('M0EJ',214);
+INSERT INTO coach_player VALUES('M0FH',50);
+INSERT INTO coach_player VALUES('M0G4',221);
+INSERT INTO coach_player VALUES('M0G4',15);
+INSERT INTO coach_player VALUES('M0GZ',60);
+INSERT INTO coach_player VALUES('M0JF',116);
+INSERT INTO coach_player VALUES('M0K4',102);
+INSERT INTO coach_player VALUES('M0K4',81);
+INSERT INTO coach_player VALUES('M0NI',227);
+INSERT INTO coach_player VALUES('M0OQ',188);
+INSERT INTO coach_player VALUES('M0OQ',236);
+INSERT INTO coach_player VALUES('M0QI',199);
+INSERT INTO coach_player VALUES('M0QI',46);
+INSERT INTO coach_player VALUES('ME82',64);
+INSERT INTO coach_player VALUES('MJ08',203);
+INSERT INTO coach_player VALUES('MJ08',184);
+INSERT INTO coach_player VALUES('MM58',89);
+INSERT INTO coach_player VALUES('MN13',86);
+INSERT INTO coach_player VALUES('MO44',87);
+INSERT INTO coach_player VALUES('MO44',59);
+INSERT INTO coach_player VALUES('MP20',241);
+INSERT INTO coach_player VALUES('MQ75',142);
+INSERT INTO coach_player VALUES('MQ75',43);
+INSERT INTO coach_player VALUES('MU94',109);
+INSERT INTO coach_player VALUES('MU94',166);
+INSERT INTO coach_player VALUES('MW02',98);
+INSERT INTO coach_player VALUES('N0AE',149);
+INSERT INTO coach_player VALUES('N0AM',181);
+INSERT INTO coach_player VALUES('N0BG',45);
+INSERT INTO coach_player VALUES('N0BG',83);
+INSERT INTO coach_player VALUES('N0BS',16);
+INSERT INTO coach_player VALUES('N552',223);
+INSERT INTO coach_player VALUES('N732',130);
+INSERT INTO coach_player VALUES('N771',71);
+INSERT INTO coach_player VALUES('N897',210);
+INSERT INTO coach_player VALUES('O0A2',219);
+INSERT INTO coach_player VALUES('O483',99);
+INSERT INTO coach_player VALUES('O513',216);
+INSERT INTO coach_player VALUES('O513',240);
+INSERT INTO coach_player VALUES('O522',110);
+INSERT INTO coach_player VALUES('O522',82);
+INSERT INTO coach_player VALUES('P09O',27);
+INSERT INTO coach_player VALUES('P09Z',170);
+INSERT INTO coach_player VALUES('P09Z',238);
+INSERT INTO coach_player VALUES('P0CT',200);
+INSERT INTO coach_player VALUES('P0HT',169);
+INSERT INTO coach_player VALUES('P0HW',141);
+INSERT INTO coach_player VALUES('PF39',62);
+INSERT INTO coach_player VALUES('PF39',173);
+INSERT INTO coach_player VALUES('PL56',34);
+INSERT INTO coach_player VALUES('PL56',97);
+INSERT INTO coach_player VALUES('Q02L',34);
+INSERT INTO coach_player VALUES('Q02L',35);
+INSERT INTO coach_player VALUES('R0DG',135);
+INSERT INTO coach_player VALUES('R0DG',132);
+INSERT INTO coach_player VALUES('R0E0',13);
+INSERT INTO coach_player VALUES('R0EB',127);
+INSERT INTO coach_player VALUES('R0FS',242);
+INSERT INTO coach_player VALUES('R0GO',14);
+INSERT INTO coach_player VALUES('R0GO',191);
+INSERT INTO coach_player VALUES('R772',121);
+INSERT INTO coach_player VALUES('R772',88);
+INSERT INTO coach_player VALUES('RE44',74);
+INSERT INTO coach_player VALUES('RE44',5);
+INSERT INTO coach_player VALUES('RH16',42);
+INSERT INTO coach_player VALUES('RH16',190);
+INSERT INTO coach_player VALUES('RH24',72);
+INSERT INTO coach_player VALUES('S0AG',215);
+INSERT INTO coach_player VALUES('S0AG',53);
+INSERT INTO coach_player VALUES('S0GD',146);
+INSERT INTO coach_player VALUES('S0H2',8);
+INSERT INTO coach_player VALUES('S0H2',19);
+INSERT INTO coach_player VALUES('S0HR',239);
+INSERT INTO coach_player VALUES('S0HR',235);
+INSERT INTO coach_player VALUES('S0JA',187);
+INSERT INTO coach_player VALUES('S0JA',222);
+INSERT INTO coach_player VALUES('S0K7',55);
+INSERT INTO coach_player VALUES('S0K7',44);
+INSERT INTO coach_player VALUES('S0N0',18);
+INSERT INTO coach_player VALUES('S0N0',84);
+INSERT INTO coach_player VALUES('S0RE',153);
+INSERT INTO coach_player VALUES('S0S1',36);
+INSERT INTO coach_player VALUES('S0ZE',201);
+INSERT INTO coach_player VALUES('SL28',40);
+INSERT INTO coach_player VALUES('SU87',69);
+INSERT INTO coach_player VALUES('SX50',168);
+INSERT INTO coach_player VALUES('SX91',39);
+INSERT INTO coach_player VALUES('T09X',179);
+INSERT INTO coach_player VALUES('T0A1',165);
+INSERT INTO coach_player VALUES('T0AP',31);
+INSERT INTO coach_player VALUES('T0BW',230);
+INSERT INTO coach_player VALUES('T0GR',206);
+INSERT INTO coach_player VALUES('T0GR',11);
+INSERT INTO coach_player VALUES('T0GR',220);
+INSERT INTO coach_player VALUES('T0HA',63);
+INSERT INTO coach_player VALUES('TC01',54);
+INSERT INTO coach_player VALUES('TC01',29);
+INSERT INTO coach_player VALUES('TC61',205);
+INSERT INTO coach_player VALUES('TD51',57);
+INSERT INTO coach_player VALUES('TD51',115);
+INSERT INTO coach_player VALUES('TE30',95);
+INSERT INTO coach_player VALUES('TE51',24);
+INSERT INTO coach_player VALUES('U182',67);
+INSERT INTO coach_player VALUES('V0AM',106);
+INSERT INTO coach_player VALUES('V812',193);
+INSERT INTO coach_player VALUES('V812',79);
+INSERT INTO coach_player VALUES('V832',177);
+INSERT INTO coach_player VALUES('V832',111);
+INSERT INTO coach_player VALUES('VA25',30);
+INSERT INTO coach_player VALUES('W09E',151);
+INSERT INTO coach_player VALUES('W0BH',103);
+INSERT INTO coach_player VALUES('W367',143);
+INSERT INTO coach_player VALUES('WB08',131);
+INSERT INTO coach_player VALUES('WB32',52);
+INSERT INTO coach_player VALUES('Y09V',198);
+INSERT INTO coach_player VALUES('Z09Z',161);
+INSERT INTO coach_player VALUES('Z0A1',157);
+INSERT INTO coach_player VALUES('Z0A1',172);
+INSERT INTO coach_player VALUES('Z0A1',229);
+INSERT INTO coach_player VALUES('Z0CQ',195);
+INSERT INTO coach_player VALUES('Z355',12);
+INSERT INTO coach_player VALUES('Z371',243);
+INSERT INTO coach_player VALUES('Z371',23);
+
+-- load tournament_entry rows
+INSERT INTO tournament_entry VALUES(1,'A0FC',NULL,NULL,44,1240);
+INSERT INTO tournament_entry VALUES(1,'AE14',NULL,'Q',67,892);
+INSERT INTO tournament_entry VALUES(1,'AG37',18,NULL,19,2375);
+INSERT INTO tournament_entry VALUES(1,'B0BI',32,NULL,33,1580);
+INSERT INTO tournament_entry VALUES(1,'B0GG',NULL,NULL,66,893);
+INSERT INTO tournament_entry VALUES(1,'BD06',NULL,NULL,55,979);
+INSERT INTO tournament_entry VALUES(1,'BK40',30,NULL,31,1620);
+INSERT INTO tournament_entry VALUES(1,'BK92',NULL,NULL,75,820);
+INSERT INTO tournament_entry VALUES(1,'BM95',NULL,NULL,62,908);
+INSERT INTO tournament_entry VALUES(1,'BT72',NULL,NULL,41,1355);
+INSERT INTO tournament_entry VALUES(1,'BU13',NULL,NULL,50,1096);
+INSERT INTO tournament_entry VALUES(1,'C0AU',20,NULL,21,2225);
+INSERT INTO tournament_entry VALUES(1,'C0C8',NULL,'Q',126,469);
+INSERT INTO tournament_entry VALUES(1,'C0DF',NULL,NULL,70,872);
+INSERT INTO tournament_entry VALUES(1,'C0E9',NULL,NULL,36,1520);
+INSERT INTO tournament_entry VALUES(1,'C0NB',NULL,'WC',373,130);
+INSERT INTO tournament_entry VALUES(1,'C977',NULL,'WC',109,563);
+INSERT INTO tournament_entry VALUES(1,'CD85',NULL,'WC',96,607);
+INSERT INTO tournament_entry VALUES(1,'CG80',NULL,'Q',104,576);
+INSERT INTO tournament_entry VALUES(1,'D0CO',5,NULL,6,3820);
+INSERT INTO tournament_entry VALUES(1,'D0F6',NULL,'LL',78,791);
+INSERT INTO tournament_entry VALUES(1,'D0FJ',NULL,NULL,46,1229);
+INSERT INTO tournament_entry VALUES(1,'D643',4,NULL,5,4120);
+INSERT INTO tournament_entry VALUES(1,'D875',15,NULL,16,2595);
+INSERT INTO tournament_entry VALUES(1,'D923',NULL,NULL,63,906);
+INSERT INTO tournament_entry VALUES(1,'DB63',NULL,NULL,71,872);
+INSERT INTO tournament_entry VALUES(1,'DH50',28,NULL,29,1745);
+INSERT INTO tournament_entry VALUES(1,'DH58',6,NULL,7,3585);
+INSERT INTO tournament_entry VALUES(1,'EA24',NULL,NULL,51,1010);
+INSERT INTO tournament_entry VALUES(1,'F0BY',NULL,'Q',68,883);
+INSERT INTO tournament_entry VALUES(1,'F0F1',13,NULL,14,2920);
+INSERT INTO tournament_entry VALUES(1,'F0FV',NULL,NULL,65,897);
+INSERT INTO tournament_entry VALUES(1,'F510',NULL,'Q',112,536);
+INSERT INTO tournament_entry VALUES(1,'FB98',3,NULL,4,5115);
+INSERT INTO tournament_entry VALUES(1,'G09O',NULL,'Q',80,776);
+INSERT INTO tournament_entry VALUES(1,'GB88',NULL,NULL,49,1121);
+INSERT INTO tournament_entry VALUES(1,'GC88',NULL,NULL,45,1240);
+INSERT INTO tournament_entry VALUES(1,'GH92',NULL,'Q',353,141);
+INSERT INTO tournament_entry VALUES(1,'GJ37',NULL,NULL,34,1575);
+INSERT INTO tournament_entry VALUES(1,'H0BH',NULL,'LL',84,754);
+INSERT INTO tournament_entry VALUES(1,'HB64',NULL,NULL,52,1005);
+INSERT INTO tournament_entry VALUES(1,'HB71',27,NULL,28,1755);
+INSERT INTO tournament_entry VALUES(1,'HH26',21,NULL,22,2185);
+INSERT INTO tournament_entry VALUES(1,'J551',NULL,NULL,57,965);
+INSERT INTO tournament_entry VALUES(1,'K0AH',23,NULL,24,2020);
+INSERT INTO tournament_entry VALUES(1,'K0AZ',NULL,NULL,77,805);
+INSERT INTO tournament_entry VALUES(1,'KE29',24,NULL,25,1960);
+INSERT INTO tournament_entry VALUES(1,'KI82',NULL,'Q',95,619);
+INSERT INTO tournament_entry VALUES(1,'KI95',NULL,NULL,47,1166);
+INSERT INTO tournament_entry VALUES(1,'L0BV',26,NULL,27,1795);
+INSERT INTO tournament_entry VALUES(1,'L0IL',NULL,'WC',148,388);
+INSERT INTO tournament_entry VALUES(1,'L987',NULL,'Q',138,426);
+INSERT INTO tournament_entry VALUES(1,'M0CI',NULL,NULL,58,955);
+INSERT INTO tournament_entry VALUES(1,'M0EJ',10,NULL,11,3200);
+INSERT INTO tournament_entry VALUES(1,'M0FH',19,NULL,20,2235);
+INSERT INTO tournament_entry VALUES(1,'M0G4',NULL,'Q',160,354);
+INSERT INTO tournament_entry VALUES(1,'M0GZ',NULL,NULL,37,1464);
+INSERT INTO tournament_entry VALUES(1,'M0JF',NULL,NULL,61,911);
+INSERT INTO tournament_entry VALUES(1,'M0K4',NULL,'Q',114,522);
+INSERT INTO tournament_entry VALUES(1,'M0NI',22,NULL,23,2032);
+INSERT INTO tournament_entry VALUES(1,'M0QI',NULL,NULL,38,1445);
+INSERT INTO tournament_entry VALUES(1,'MC65',NULL,NULL,42,1255);
+INSERT INTO tournament_entry VALUES(1,'MM58',9,NULL,10,3290);
+INSERT INTO tournament_entry VALUES(1,'MO44',NULL,NULL,48,1130);
+INSERT INTO tournament_entry VALUES(1,'MP20',NULL,NULL,39,1366);
+INSERT INTO tournament_entry VALUES(1,'MQ75',NULL,'LL',90,669);
+INSERT INTO tournament_entry VALUES(1,'MU94',NULL,NULL,53,1002);
+INSERT INTO tournament_entry VALUES(1,'MW02',NULL,NULL,82,759);
+INSERT INTO tournament_entry VALUES(1,'N0AE',31,NULL,32,1605);
+INSERT INTO tournament_entry VALUES(1,'N0BS',NULL,NULL,85,750);
+INSERT INTO tournament_entry VALUES(1,'N552',NULL,NULL,64,898);
+INSERT INTO tournament_entry VALUES(1,'N771',NULL,NULL,91,667);
+INSERT INTO tournament_entry VALUES(1,'O483',NULL,NULL,87,745);
+INSERT INTO tournament_entry VALUES(1,'O513',NULL,'PR',153,378);
+INSERT INTO tournament_entry VALUES(1,'O522',NULL,'PR',103,579);
+INSERT INTO tournament_entry VALUES(1,'P09Z',25,NULL,26,1860);
+INSERT INTO tournament_entry VALUES(1,'PL56',11,NULL,12,3160);
+INSERT INTO tournament_entry VALUES(1,'Q02L',NULL,'Q',119,494);
+INSERT INTO tournament_entry VALUES(1,'R0DG',8,NULL,9,3480);
+INSERT INTO tournament_entry VALUES(1,'RC91',NULL,NULL,76,809);
+INSERT INTO tournament_entry VALUES(1,'RE44',7,NULL,8,3530);
+INSERT INTO tournament_entry VALUES(1,'RH16',14,NULL,15,2815);
+INSERT INTO tournament_entry VALUES(1,'S0S1',12,NULL,13,3020);
+INSERT INTO tournament_entry VALUES(1,'SL28',NULL,NULL,79,790);
+INSERT INTO tournament_entry VALUES(1,'SU55',29,NULL,30,1726);
+INSERT INTO tournament_entry VALUES(1,'SU87',NULL,NULL,43,1245);
+INSERT INTO tournament_entry VALUES(1,'SX50',NULL,NULL,73,856);
+INSERT INTO tournament_entry VALUES(1,'T0HA',NULL,NULL,69,880);
+INSERT INTO tournament_entry VALUES(1,'TD51',16,NULL,17,2550);
+INSERT INTO tournament_entry VALUES(1,'TE51',17,NULL,18,2415);
+INSERT INTO tournament_entry VALUES(1,'U182',NULL,NULL,59,947);
+INSERT INTO tournament_entry VALUES(1,'V812',NULL,'LL',88,743);
+INSERT INTO tournament_entry VALUES(1,'V832',NULL,NULL,83,758);
+INSERT INTO tournament_entry VALUES(1,'W0BH',NULL,'WC',169,322);
+INSERT INTO tournament_entry VALUES(1,'Y09V',NULL,NULL,72,869);
+INSERT INTO tournament_entry VALUES(1,'Z355',1,NULL,2,8085);
+INSERT INTO tournament_entry VALUES(2,'A0E2',1,NULL,1,11340);
+INSERT INTO tournament_entry VALUES(2,'A0GC',NULL,NULL,69,874);
+INSERT INTO tournament_entry VALUES(2,'AE14',NULL,NULL,50,1039);
+INSERT INTO tournament_entry VALUES(2,'AG37',9,NULL,10,3195);
+INSERT INTO tournament_entry VALUES(2,'B0BI',NULL,NULL,43,1155);
+INSERT INTO tournament_entry VALUES(2,'BK92',13,NULL,16,2520);
+INSERT INTO tournament_entry VALUES(2,'BT72',NULL,NULL,46,1120);
+INSERT INTO tournament_entry VALUES(2,'BU13',NULL,NULL,41,1274);
+INSERT INTO tournament_entry VALUES(2,'C0AU',NULL,NULL,21,2085);
+INSERT INTO tournament_entry VALUES(2,'C0DF',NULL,NULL,68,880);
+INSERT INTO tournament_entry VALUES(2,'C0E9',NULL,NULL,23,1975);
+INSERT INTO tournament_entry VALUES(2,'C0H0',NULL,NULL,62,902);
+INSERT INTO tournament_entry VALUES(2,'D0F6',NULL,NULL,42,1228);
+INSERT INTO tournament_entry VALUES(2,'D0FJ',NULL,NULL,27,1624);
+INSERT INTO tournament_entry VALUES(2,'D875',NULL,NULL,38,1330);
+INSERT INTO tournament_entry VALUES(2,'D923',NULL,NULL,63,898);
+INSERT INTO tournament_entry VALUES(2,'DH50',15,NULL,15,2585);
+INSERT INTO tournament_entry VALUES(2,'DH58',6,NULL,6,3935);
+INSERT INTO tournament_entry VALUES(2,'EA24',NULL,NULL,58,930);
+INSERT INTO tournament_entry VALUES(2,'F0BY',NULL,NULL,78,769);
+INSERT INTO tournament_entry VALUES(2,'F0FV',NULL,NULL,28,1615);
+INSERT INTO tournament_entry VALUES(2,'FB98',4,NULL,4,4685);
+INSERT INTO tournament_entry VALUES(2,'GC88',NULL,NULL,65,885);
+INSERT INTO tournament_entry VALUES(2,'GJ37',NULL,NULL,25,1655);
+INSERT INTO tournament_entry VALUES(2,'K0AH',NULL,NULL,54,970);
+INSERT INTO tournament_entry VALUES(2,'K0AZ',NULL,NULL,64,889);
+INSERT INTO tournament_entry VALUES(2,'KE29',10,NULL,14,2620);
+INSERT INTO tournament_entry VALUES(2,'KI95',NULL,NULL,53,1001);
+INSERT INTO tournament_entry VALUES(2,'L0BV',14,NULL,18,2415);
+INSERT INTO tournament_entry VALUES(2,'M0CI',NULL,NULL,48,1065);
+INSERT INTO tournament_entry VALUES(2,'M0EJ',7,NULL,8,3685);
+INSERT INTO tournament_entry VALUES(2,'M0FH',NULL,NULL,34,1445);
+INSERT INTO tournament_entry VALUES(2,'M0GZ',NULL,NULL,56,965);
+INSERT INTO tournament_entry VALUES(2,'M0QI',NULL,NULL,35,1440);
+INSERT INTO tournament_entry VALUES(2,'MM58',11,NULL,13,2810);
+INSERT INTO tournament_entry VALUES(2,'MP20',NULL,NULL,44,1150);
+INSERT INTO tournament_entry VALUES(2,'MU94',NULL,NULL,36,1395);
+INSERT INTO tournament_entry VALUES(2,'MW02',NULL,NULL,32,1473);
+INSERT INTO tournament_entry VALUES(2,'N0AE',NULL,NULL,33,1470);
+INSERT INTO tournament_entry VALUES(2,'N771',NULL,NULL,31,1483);
+INSERT INTO tournament_entry VALUES(2,'O522',NULL,NULL,52,1010);
+INSERT INTO tournament_entry VALUES(2,'P09Z',NULL,NULL,47,1090);
+INSERT INTO tournament_entry VALUES(2,'Q02L',NULL,NULL,71,837);
+INSERT INTO tournament_entry VALUES(2,'R0EB',NULL,NULL,59,922);
+INSERT INTO tournament_entry VALUES(2,'RC91',NULL,NULL,29,1590);
+INSERT INTO tournament_entry VALUES(2,'RE44',12,NULL,17,2470);
+INSERT INTO tournament_entry VALUES(2,'RH16',8,NULL,9,3235);
+INSERT INTO tournament_entry VALUES(2,'S0AG',2,NULL,2,10500);
+INSERT INTO tournament_entry VALUES(2,'S0S1',5,NULL,7,3820);
+INSERT INTO tournament_entry VALUES(2,'SU55',NULL,NULL,24,1928);
+INSERT INTO tournament_entry VALUES(2,'SU87',NULL,NULL,45,1130);
+INSERT INTO tournament_entry VALUES(2,'T0HA',NULL,NULL,39,1316);
+INSERT INTO tournament_entry VALUES(2,'U182',NULL,NULL,49,1053);
+INSERT INTO tournament_entry VALUES(2,'V832',NULL,NULL,103,633);
+INSERT INTO tournament_entry VALUES(2,'VA25',NULL,NULL,40,1283);
+INSERT INTO tournament_entry VALUES(2,'Z355',3,NULL,3,6160);
+INSERT INTO tournament_entry VALUES(3,'A0E2',2,NULL,3,6910);
+INSERT INTO tournament_entry VALUES(3,'A0FC',NULL,NULL,35,1410);
+INSERT INTO tournament_entry VALUES(3,'AE14',NULL,NULL,82,783);
+INSERT INTO tournament_entry VALUES(3,'AG37',18,NULL,19,2415);
+INSERT INTO tournament_entry VALUES(3,'B0BI',NULL,NULL,36,1385);
+INSERT INTO tournament_entry VALUES(3,'B0CD',NULL,'PR',544,67);
+INSERT INTO tournament_entry VALUES(3,'B0GG',NULL,NULL,72,838);
+INSERT INTO tournament_entry VALUES(3,'B0PG',NULL,'Q',163,354);
+INSERT INTO tournament_entry VALUES(3,'BD06',NULL,NULL,50,1089);
+INSERT INTO tournament_entry VALUES(3,'BK40',29,NULL,30,1580);
+INSERT INTO tournament_entry VALUES(3,'BK92',NULL,NULL,80,785);
+INSERT INTO tournament_entry VALUES(3,'BM95',NULL,NULL,63,920);
+INSERT INTO tournament_entry VALUES(3,'BT72',NULL,NULL,42,1280);
+INSERT INTO tournament_entry VALUES(3,'BU13',NULL,NULL,51,1065);
+INSERT INTO tournament_entry VALUES(3,'C0AU',23,NULL,24,1925);
+INSERT INTO tournament_entry VALUES(3,'C0DF',NULL,'Q',67,866);
+INSERT INTO tournament_entry VALUES(3,'C0E9',NULL,NULL,43,1280);
+INSERT INTO tournament_entry VALUES(3,'C0NB',NULL,'WC',441,105);
+INSERT INTO tournament_entry VALUES(3,'CF59',NULL,NULL,53,1051);
+INSERT INTO tournament_entry VALUES(3,'D0CO',6,NULL,7,3800);
+INSERT INTO tournament_entry VALUES(3,'D0F6',NULL,'LL',87,730);
+INSERT INTO tournament_entry VALUES(3,'D0FJ',NULL,NULL,61,945);
+INSERT INTO tournament_entry VALUES(3,'D643',4,NULL,5,3860);
+INSERT INTO tournament_entry VALUES(3,'D875',14,NULL,15,2745);
+INSERT INTO tournament_entry VALUES(3,'DH50',NULL,NULL,39,1325);
+INSERT INTO tournament_entry VALUES(3,'DH58',10,NULL,11,3335);
+INSERT INTO tournament_entry VALUES(3,'E865',NULL,'WC',104,563);
+INSERT INTO tournament_entry VALUES(3,'EA24',NULL,NULL,44,1275);
+INSERT INTO tournament_entry VALUES(3,'F0BY',NULL,'Q',83,770);
+INSERT INTO tournament_entry VALUES(3,'F0F1',17,NULL,18,2480);
+INSERT INTO tournament_entry VALUES(3,'F0FV',NULL,NULL,60,955);
+INSERT INTO tournament_entry VALUES(3,'FB98',3,NULL,4,4900);
+INSERT INTO tournament_entry VALUES(3,'G09O',NULL,'LL',88,711);
+INSERT INTO tournament_entry VALUES(3,'GB88',NULL,NULL,55,1003);
+INSERT INTO tournament_entry VALUES(3,'GC88',NULL,NULL,45,1240);
+INSERT INTO tournament_entry VALUES(3,'H09P',NULL,'Q',116,528);
+INSERT INTO tournament_entry VALUES(3,'H0BH',NULL,NULL,86,752);
+INSERT INTO tournament_entry VALUES(3,'HB64',NULL,NULL,57,981);
+INSERT INTO tournament_entry VALUES(3,'HD68',NULL,'Q',107,558);
+INSERT INTO tournament_entry VALUES(3,'HH26',19,NULL,20,2375);
+INSERT INTO tournament_entry VALUES(3,'K0AH',24,NULL,25,1860);
+INSERT INTO tournament_entry VALUES(3,'K0AZ',NULL,NULL,79,800);
+INSERT INTO tournament_entry VALUES(3,'KE17',NULL,'PR',892,20);
+INSERT INTO tournament_entry VALUES(3,'KE29',22,NULL,23,2000);
+INSERT INTO tournament_entry VALUES(3,'KI95',NULL,NULL,48,1161);
+INSERT INTO tournament_entry VALUES(3,'L0BV',26,NULL,27,1745);
+INSERT INTO tournament_entry VALUES(3,'M0CI',NULL,NULL,59,965);
+INSERT INTO tournament_entry VALUES(3,'M0EJ',15,NULL,16,2650);
+INSERT INTO tournament_entry VALUES(3,'M0FH',20,NULL,21,2310);
+INSERT INTO tournament_entry VALUES(3,'M0GZ',28,NULL,29,1656);
+INSERT INTO tournament_entry VALUES(3,'M0JF',NULL,NULL,73,829);
+INSERT INTO tournament_entry VALUES(3,'M0NI',NULL,NULL,54,1042);
+INSERT INTO tournament_entry VALUES(3,'M0QI',32,NULL,33,1465);
+INSERT INTO tournament_entry VALUES(3,'MC65',NULL,NULL,46,1230);
+INSERT INTO tournament_entry VALUES(3,'MK66',NULL,'Q',101,575);
+INSERT INTO tournament_entry VALUES(3,'MM58',7,NULL,8,3680);
+INSERT INTO tournament_entry VALUES(3,'MO44',NULL,NULL,40,1295);
+INSERT INTO tournament_entry VALUES(3,'MP20',NULL,NULL,41,1287);
+INSERT INTO tournament_entry VALUES(3,'MU94',NULL,NULL,56,992);
+INSERT INTO tournament_entry VALUES(3,'MW02',NULL,NULL,76,814);
+INSERT INTO tournament_entry VALUES(3,'N0AE',31,NULL,32,1500);
+INSERT INTO tournament_entry VALUES(3,'N0BS',NULL,NULL,62,925);
+INSERT INTO tournament_entry VALUES(3,'N732',NULL,NULL,68,859);
+INSERT INTO tournament_entry VALUES(3,'N771',NULL,NULL,81,784);
+INSERT INTO tournament_entry VALUES(3,'O483',NULL,'Q',78,805);
+INSERT INTO tournament_entry VALUES(3,'O522',NULL,'PR',114,529);
+INSERT INTO tournament_entry VALUES(3,'P09Z',25,NULL,26,1800);
+INSERT INTO tournament_entry VALUES(3,'PL56',12,NULL,13,3030);
+INSERT INTO tournament_entry VALUES(3,'Q02L',NULL,'Q',135,432);
+INSERT INTO tournament_entry VALUES(3,'R0DG',11,NULL,12,3270);
+INSERT INTO tournament_entry VALUES(3,'RC91',NULL,NULL,74,821);
+INSERT INTO tournament_entry VALUES(3,'RE44',8,NULL,9,3440);
+INSERT INTO tournament_entry VALUES(3,'RH16',5,NULL,6,3855);
+INSERT INTO tournament_entry VALUES(3,'S0JA',NULL,'WC',134,434);
+INSERT INTO tournament_entry VALUES(3,'S0N0',NULL,'Q',129,450);
+INSERT INTO tournament_entry VALUES(3,'S0S1',13,NULL,14,2980);
+INSERT INTO tournament_entry VALUES(3,'S0UV',NULL,'Q',330,157);
+INSERT INTO tournament_entry VALUES(3,'SL28',NULL,NULL,49,1160);
+INSERT INTO tournament_entry VALUES(3,'SU55',27,NULL,28,1716);
+INSERT INTO tournament_entry VALUES(3,'SU87',NULL,NULL,38,1356);
+INSERT INTO tournament_entry VALUES(3,'SX50',NULL,NULL,71,851);
+INSERT INTO tournament_entry VALUES(3,'SX91',NULL,NULL,96,617);
+INSERT INTO tournament_entry VALUES(3,'T0A1',NULL,'Q',117,512);
+INSERT INTO tournament_entry VALUES(3,'T0AP',NULL,'Q',115,529);
+INSERT INTO tournament_entry VALUES(3,'T0HA',NULL,NULL,66,867);
+INSERT INTO tournament_entry VALUES(3,'TC61',NULL,NULL,37,1375);
+INSERT INTO tournament_entry VALUES(3,'TD51',16,NULL,17,2485);
+INSERT INTO tournament_entry VALUES(3,'TE30',30,NULL,31,1555);
+INSERT INTO tournament_entry VALUES(3,'TE51',9,NULL,10,3405);
+INSERT INTO tournament_entry VALUES(3,'U182',NULL,'LL',65,870);
+INSERT INTO tournament_entry VALUES(3,'V832',NULL,NULL,77,814);
+INSERT INTO tournament_entry VALUES(3,'W09E',NULL,'LL',89,666);
+INSERT INTO tournament_entry VALUES(3,'W0BH',NULL,'WC',182,312);
+INSERT INTO tournament_entry VALUES(3,'WB32',NULL,'WC',421,113);
+INSERT INTO tournament_entry VALUES(3,'Y09V',NULL,NULL,69,855);
+INSERT INTO tournament_entry VALUES(3,'Z355',1,NULL,2,7945);
+INSERT INTO tournament_entry VALUES(4,'A0E2',2,NULL,3,7510);
+INSERT INTO tournament_entry VALUES(4,'A0FC',NULL,NULL,35,1390);
+INSERT INTO tournament_entry VALUES(4,'AG37',17,NULL,18,2455);
+INSERT INTO tournament_entry VALUES(4,'B0BI',NULL,NULL,34,1425);
+INSERT INTO tournament_entry VALUES(4,'B0CD',NULL,'PR',937,17);
+INSERT INTO tournament_entry VALUES(4,'B0EJ',NULL,'WC',117,501);
+INSERT INTO tournament_entry VALUES(4,'B0NN',NULL,'WC',101,587);
+INSERT INTO tournament_entry VALUES(4,'BD06',NULL,NULL,50,1089);
+INSERT INTO tournament_entry VALUES(4,'BG23',NULL,'Q',152,383);
+INSERT INTO tournament_entry VALUES(4,'BK40',28,NULL,29,1620);
+INSERT INTO tournament_entry VALUES(4,'BK92',NULL,NULL,82,745);
+INSERT INTO tournament_entry VALUES(4,'BM95',NULL,NULL,62,910);
+INSERT INTO tournament_entry VALUES(4,'BT72',NULL,NULL,36,1385);
+INSERT INTO tournament_entry VALUES(4,'BU13',NULL,NULL,53,1060);
+INSERT INTO tournament_entry VALUES(4,'C0AU',25,NULL,26,1775);
+INSERT INTO tournament_entry VALUES(4,'C0E9',NULL,NULL,40,1295);
+INSERT INTO tournament_entry VALUES(4,'CD85',NULL,'Q',112,524);
+INSERT INTO tournament_entry VALUES(4,'CF59',NULL,NULL,52,1071);
+INSERT INTO tournament_entry VALUES(4,'D0CO',13,NULL,14,2810);
+INSERT INTO tournament_entry VALUES(4,'D0F6',NULL,'LL',88,690);
+INSERT INTO tournament_entry VALUES(4,'D0FJ',NULL,NULL,60,945);
+INSERT INTO tournament_entry VALUES(4,'D643',6,NULL,7,3900);
+INSERT INTO tournament_entry VALUES(4,'D875',14,NULL,15,2745);
+INSERT INTO tournament_entry VALUES(4,'D923',NULL,'Q',84,712);
+INSERT INTO tournament_entry VALUES(4,'DH50',NULL,NULL,39,1325);
+INSERT INTO tournament_entry VALUES(4,'DH58',9,NULL,10,3335);
+INSERT INTO tournament_entry VALUES(4,'EA24',NULL,NULL,45,1265);
+INSERT INTO tournament_entry VALUES(4,'F0BY',NULL,NULL,81,747);
+INSERT INTO tournament_entry VALUES(4,'F0F1',20,NULL,21,2330);
+INSERT INTO tournament_entry VALUES(4,'F0FV',NULL,'WC',80,750);
+INSERT INTO tournament_entry VALUES(4,'FB98',3,NULL,4,4900);
+INSERT INTO tournament_entry VALUES(4,'G09O',NULL,'Q',93,636);
+INSERT INTO tournament_entry VALUES(4,'G0GD',NULL,'Q',217,256);
+INSERT INTO tournament_entry VALUES(4,'GB88',NULL,NULL,56,1006);
+INSERT INTO tournament_entry VALUES(4,'GC88',NULL,NULL,48,1150);
+INSERT INTO tournament_entry VALUES(4,'GJ37',NULL,NULL,43,1270);
+INSERT INTO tournament_entry VALUES(4,'H0BH',NULL,NULL,83,732);
+INSERT INTO tournament_entry VALUES(4,'HB64',NULL,NULL,59,976);
+INSERT INTO tournament_entry VALUES(4,'HB71',21,NULL,22,2165);
+INSERT INTO tournament_entry VALUES(4,'HH26',18,NULL,19,2375);
+INSERT INTO tournament_entry VALUES(4,'K0AH',24,NULL,25,1900);
+INSERT INTO tournament_entry VALUES(4,'K0AZ',NULL,NULL,94,630);
+INSERT INTO tournament_entry VALUES(4,'KE17',NULL,'PR',1099,10);
+INSERT INTO tournament_entry VALUES(4,'KE29',22,NULL,23,1960);
+INSERT INTO tournament_entry VALUES(4,'KI95',NULL,NULL,49,1146);
+INSERT INTO tournament_entry VALUES(4,'L0BV',23,NULL,24,1935);
+INSERT INTO tournament_entry VALUES(4,'L987',NULL,NULL,108,555);
+INSERT INTO tournament_entry VALUES(4,'M0CI',NULL,NULL,54,1035);
+INSERT INTO tournament_entry VALUES(4,'M0EJ',15,NULL,16,2650);
+INSERT INTO tournament_entry VALUES(4,'M0FH',19,NULL,20,2330);
+INSERT INTO tournament_entry VALUES(4,'M0GZ',29,NULL,30,1616);
+INSERT INTO tournament_entry VALUES(4,'M0NI',NULL,NULL,57,992);
+INSERT INTO tournament_entry VALUES(4,'M0QI',31,NULL,32,1445);
+INSERT INTO tournament_entry VALUES(4,'MC65',NULL,NULL,42,1280);
+INSERT INTO tournament_entry VALUES(4,'MK66',NULL,'WC',109,555);
+INSERT INTO tournament_entry VALUES(4,'MM58',5,NULL,6,3930);
+INSERT INTO tournament_entry VALUES(4,'MO44',NULL,NULL,41,1295);
+INSERT INTO tournament_entry VALUES(4,'MP20',NULL,NULL,44,1270);
+INSERT INTO tournament_entry VALUES(4,'MU94',NULL,NULL,58,992);
+INSERT INTO tournament_entry VALUES(4,'MW02',NULL,NULL,79,759);
+INSERT INTO tournament_entry VALUES(4,'N0AE',32,NULL,33,1430);
+INSERT INTO tournament_entry VALUES(4,'N0BG',NULL,NULL,67,862);
+INSERT INTO tournament_entry VALUES(4,'N0BS',NULL,NULL,63,905);
+INSERT INTO tournament_entry VALUES(4,'N552',NULL,NULL,76,793);
+INSERT INTO tournament_entry VALUES(4,'N771',NULL,NULL,77,784);
+INSERT INTO tournament_entry VALUES(4,'O483',NULL,NULL,75,805);
+INSERT INTO tournament_entry VALUES(4,'O522',NULL,'WC',114,516);
+INSERT INTO tournament_entry VALUES(4,'P09Z',26,NULL,27,1750);
+INSERT INTO tournament_entry VALUES(4,'PL56',10,NULL,11,3330);
+INSERT INTO tournament_entry VALUES(4,'Q02L',NULL,'Q',137,432);
+INSERT INTO tournament_entry VALUES(4,'R0DG',12,NULL,13,2820);
+INSERT INTO tournament_entry VALUES(4,'RC91',NULL,NULL,73,824);
+INSERT INTO tournament_entry VALUES(4,'RE44',7,NULL,8,3480);
+INSERT INTO tournament_entry VALUES(4,'RH16',4,NULL,5,4045);
+INSERT INTO tournament_entry VALUES(4,'S0H2',NULL,NULL,98,618);
+INSERT INTO tournament_entry VALUES(4,'S0S1',11,NULL,12,2880);
+INSERT INTO tournament_entry VALUES(4,'S0ZE',NULL,'Q',261,209);
+INSERT INTO tournament_entry VALUES(4,'SL28',NULL,NULL,46,1200);
+INSERT INTO tournament_entry VALUES(4,'SU55',27,NULL,28,1696);
+INSERT INTO tournament_entry VALUES(4,'SU87',NULL,NULL,37,1376);
+INSERT INTO tournament_entry VALUES(4,'SX50',NULL,NULL,69,848);
+INSERT INTO tournament_entry VALUES(4,'SX91',NULL,NULL,91,657);
+INSERT INTO tournament_entry VALUES(4,'T0HA',NULL,NULL,68,857);
+INSERT INTO tournament_entry VALUES(4,'TC01',NULL,'Q',177,326);
+INSERT INTO tournament_entry VALUES(4,'TC61',NULL,NULL,38,1375);
+INSERT INTO tournament_entry VALUES(4,'TD51',16,NULL,17,2485);
+INSERT INTO tournament_entry VALUES(4,'TE30',30,NULL,31,1535);
+INSERT INTO tournament_entry VALUES(4,'TE51',8,NULL,9,3405);
+INSERT INTO tournament_entry VALUES(4,'V812',NULL,'LL',85,710);
+INSERT INTO tournament_entry VALUES(4,'V832',NULL,NULL,64,868);
+INSERT INTO tournament_entry VALUES(4,'W09E',NULL,'Q',96,629);
+INSERT INTO tournament_entry VALUES(4,'WB08',NULL,'Q',349,144);
+INSERT INTO tournament_entry VALUES(4,'Y09V',NULL,NULL,71,833);
+INSERT INTO tournament_entry VALUES(4,'Z0A1',NULL,'Q',394,125);
+INSERT INTO tournament_entry VALUES(4,'Z355',1,NULL,2,8135);
+INSERT INTO tournament_entry VALUES(4,'Z371',NULL,NULL,51,1075);
+INSERT INTO tournament_entry VALUES(5,'A0E2',2,NULL,3,6720);
+INSERT INTO tournament_entry VALUES(5,'A0FC',NULL,NULL,40,1340);
+INSERT INTO tournament_entry VALUES(5,'AE14',NULL,'Q',84,763);
+INSERT INTO tournament_entry VALUES(5,'AG37',16,NULL,19,2415);
+INSERT INTO tournament_entry VALUES(5,'B0BI',NULL,NULL,33,1540);
+INSERT INTO tournament_entry VALUES(5,'BD06',NULL,NULL,52,1049);
+INSERT INTO tournament_entry VALUES(5,'BK40',NULL,NULL,34,1530);
+INSERT INTO tournament_entry VALUES(5,'BT72',NULL,NULL,43,1280);
+INSERT INTO tournament_entry VALUES(5,'C0AU',NULL,NULL,22,2075);
+INSERT INTO tournament_entry VALUES(5,'C0E9',NULL,NULL,36,1500);
+INSERT INTO tournament_entry VALUES(5,'D0CO',5,NULL,6,3780);
+INSERT INTO tournament_entry VALUES(5,'D643',3,NULL,5,4510);
+INSERT INTO tournament_entry VALUES(5,'D875',15,NULL,18,2495);
+INSERT INTO tournament_entry VALUES(5,'DH50',NULL,NULL,42,1305);
+INSERT INTO tournament_entry VALUES(5,'DH58',8,NULL,10,3335);
+INSERT INTO tournament_entry VALUES(5,'EA24',NULL,NULL,46,1185);
+INSERT INTO tournament_entry VALUES(5,'F0F1',12,NULL,15,2670);
+INSERT INTO tournament_entry VALUES(5,'F510',NULL,'WC',113,544);
+INSERT INTO tournament_entry VALUES(5,'G628',NULL,'WC',164,354);
+INSERT INTO tournament_entry VALUES(5,'GC88',NULL,NULL,45,1200);
+INSERT INTO tournament_entry VALUES(5,'GJ37',NULL,NULL,35,1525);
+INSERT INTO tournament_entry VALUES(5,'HH26',NULL,NULL,20,2335);
+INSERT INTO tournament_entry VALUES(5,'J551',NULL,NULL,58,965);
+INSERT INTO tournament_entry VALUES(5,'K0AH',NULL,NULL,24,2010);
+INSERT INTO tournament_entry VALUES(5,'KE29',NULL,NULL,25,1950);
+INSERT INTO tournament_entry VALUES(5,'KI95',NULL,NULL,47,1166);
+INSERT INTO tournament_entry VALUES(5,'L0BV',NULL,NULL,28,1745);
+INSERT INTO tournament_entry VALUES(5,'L987',NULL,'Q',109,570);
+INSERT INTO tournament_entry VALUES(5,'M0CI',NULL,'Q',81,775);
+INSERT INTO tournament_entry VALUES(5,'M0EJ',13,NULL,16,2650);
+INSERT INTO tournament_entry VALUES(5,'M0FH',NULL,NULL,21,2210);
+INSERT INTO tournament_entry VALUES(5,'M0GZ',NULL,NULL,30,1644);
+INSERT INTO tournament_entry VALUES(5,'MC65',NULL,NULL,44,1255);
+INSERT INTO tournament_entry VALUES(5,'MM58',9,NULL,11,3290);
+INSERT INTO tournament_entry VALUES(5,'MO44',NULL,NULL,51,1090);
+INSERT INTO tournament_entry VALUES(5,'MP20',NULL,NULL,39,1344);
+INSERT INTO tournament_entry VALUES(5,'MW02',NULL,'Q',75,809);
+INSERT INTO tournament_entry VALUES(5,'N0AE',NULL,NULL,31,1620);
+INSERT INTO tournament_entry VALUES(5,'N0BS',NULL,'Q',70,850);
+INSERT INTO tournament_entry VALUES(5,'P09Z',NULL,NULL,27,1760);
+INSERT INTO tournament_entry VALUES(5,'R0DG',10,NULL,12,3270);
+INSERT INTO tournament_entry VALUES(5,'RE44',7,NULL,9,3440);
+INSERT INTO tournament_entry VALUES(5,'RH16',4,NULL,7,3765);
+INSERT INTO tournament_entry VALUES(5,'S0S1',11,NULL,14,2690);
+INSERT INTO tournament_entry VALUES(5,'SL28',NULL,NULL,49,1120);
+INSERT INTO tournament_entry VALUES(5,'SU55',NULL,NULL,29,1716);
+INSERT INTO tournament_entry VALUES(5,'SU87',NULL,NULL,41,1336);
+INSERT INTO tournament_entry VALUES(5,'TC61',NULL,NULL,38,1365);
+INSERT INTO tournament_entry VALUES(5,'TD51',14,NULL,17,2525);
+INSERT INTO tournament_entry VALUES(5,'TE30',NULL,NULL,32,1575);
+INSERT INTO tournament_entry VALUES(5,'TE51',6,NULL,8,3445);
+INSERT INTO tournament_entry VALUES(5,'U182',NULL,'Q',63,917);
+INSERT INTO tournament_entry VALUES(5,'VA25',NULL,'WC',256,214);
+INSERT INTO tournament_entry VALUES(5,'W367',NULL,'WC',163,355);
+INSERT INTO tournament_entry VALUES(5,'Y09V',NULL,'Q',67,873);
+INSERT INTO tournament_entry VALUES(5,'Z355',1,NULL,2,7645);
+INSERT INTO tournament_entry VALUES(6,'A0E2',3,NULL,3,7850);
+INSERT INTO tournament_entry VALUES(6,'A0FC',NULL,NULL,37,1410);
+INSERT INTO tournament_entry VALUES(6,'AE14',NULL,NULL,71,872);
+INSERT INTO tournament_entry VALUES(6,'B0BI',32,NULL,33,1540);
+INSERT INTO tournament_entry VALUES(6,'B0FV',NULL,'Q',135,439);
+INSERT INTO tournament_entry VALUES(6,'B0GG',NULL,NULL,68,891);
+INSERT INTO tournament_entry VALUES(6,'BD06',NULL,NULL,56,969);
+INSERT INTO tournament_entry VALUES(6,'BK40',29,NULL,30,1670);
+INSERT INTO tournament_entry VALUES(6,'BK92',NULL,NULL,76,820);
+INSERT INTO tournament_entry VALUES(6,'BS86',NULL,'Q',118,506);
+INSERT INTO tournament_entry VALUES(6,'BT72',NULL,NULL,40,1360);
+INSERT INTO tournament_entry VALUES(6,'C0AU',17,NULL,18,2425);
+INSERT INTO tournament_entry VALUES(6,'C0DF',NULL,NULL,63,906);
+INSERT INTO tournament_entry VALUES(6,'C0E9',NULL,NULL,34,1520);
+INSERT INTO tournament_entry VALUES(6,'C0NB',NULL,'WC',323,160);
+INSERT INTO tournament_entry VALUES(6,'CD85',NULL,'LL',98,601);
+INSERT INTO tournament_entry VALUES(6,'CF59',NULL,NULL,59,946);
+INSERT INTO tournament_entry VALUES(6,'D0C1',NULL,'LL',93,640);
+INSERT INTO tournament_entry VALUES(6,'D0CO',5,NULL,5,4440);
+INSERT INTO tournament_entry VALUES(6,'D0F6',NULL,NULL,54,995);
+INSERT INTO tournament_entry VALUES(6,'D0FJ',NULL,NULL,46,1204);
+INSERT INTO tournament_entry VALUES(6,'D875',14,NULL,15,2685);
+INSERT INTO tournament_entry VALUES(6,'D923',NULL,NULL,69,881);
+INSERT INTO tournament_entry VALUES(6,'DA31',NULL,'LL',103,587);
+INSERT INTO tournament_entry VALUES(6,'DB63',NULL,NULL,64,902);
+INSERT INTO tournament_entry VALUES(6,'DH50',25,NULL,26,1745);
+INSERT INTO tournament_entry VALUES(6,'DH58',7,NULL,8,3635);
+INSERT INTO tournament_entry VALUES(6,'EA24',NULL,NULL,51,1015);
+INSERT INTO tournament_entry VALUES(6,'F0BY',NULL,NULL,57,953);
+INSERT INTO tournament_entry VALUES(6,'F0F1',13,NULL,14,2920);
+INSERT INTO tournament_entry VALUES(6,'F0FV',NULL,NULL,65,897);
+INSERT INTO tournament_entry VALUES(6,'F510',NULL,'WC',107,566);
+INSERT INTO tournament_entry VALUES(6,'FB98',4,NULL,4,4815);
+INSERT INTO tournament_entry VALUES(6,'G09O',NULL,NULL,78,793);
+INSERT INTO tournament_entry VALUES(6,'G0FW',NULL,'Q',154,371);
+INSERT INTO tournament_entry VALUES(6,'G0GD',NULL,'WC',164,341);
+INSERT INTO tournament_entry VALUES(6,'GC88',NULL,NULL,45,1245);
+INSERT INTO tournament_entry VALUES(6,'GJ37',NULL,NULL,35,1505);
+INSERT INTO tournament_entry VALUES(6,'H0BH',NULL,NULL,82,761);
+INSERT INTO tournament_entry VALUES(6,'HB64',NULL,NULL,52,1015);
+INSERT INTO tournament_entry VALUES(6,'HB71',30,NULL,31,1665);
+INSERT INTO tournament_entry VALUES(6,'HH26',21,NULL,22,2145);
+INSERT INTO tournament_entry VALUES(6,'J551',NULL,NULL,53,1010);
+INSERT INTO tournament_entry VALUES(6,'K0AH',22,NULL,23,2020);
+INSERT INTO tournament_entry VALUES(6,'K0AZ',NULL,NULL,80,785);
+INSERT INTO tournament_entry VALUES(6,'KE29',23,NULL,24,1910);
+INSERT INTO tournament_entry VALUES(6,'KI82',NULL,'Q',92,655);
+INSERT INTO tournament_entry VALUES(6,'KI95',NULL,NULL,47,1186);
+INSERT INTO tournament_entry VALUES(6,'L0BV',NULL,NULL,38,1405);
+INSERT INTO tournament_entry VALUES(6,'L987',NULL,'Q',131,446);
+INSERT INTO tournament_entry VALUES(6,'M0CI',NULL,NULL,61,935);
+INSERT INTO tournament_entry VALUES(6,'M0EJ',8,NULL,9,3550);
+INSERT INTO tournament_entry VALUES(6,'M0FH',19,NULL,20,2215);
+INSERT INTO tournament_entry VALUES(6,'M0GZ',NULL,NULL,36,1464);
+INSERT INTO tournament_entry VALUES(6,'M0JF',NULL,NULL,72,871);
+INSERT INTO tournament_entry VALUES(6,'M0NI',20,NULL,21,2182);
+INSERT INTO tournament_entry VALUES(6,'M0QI',31,NULL,32,1570);
+INSERT INTO tournament_entry VALUES(6,'MM58',10,NULL,11,3290);
+INSERT INTO tournament_entry VALUES(6,'MO44',NULL,NULL,49,1115);
+INSERT INTO tournament_entry VALUES(6,'MP20',NULL,NULL,39,1403);
+INSERT INTO tournament_entry VALUES(6,'MU94',NULL,NULL,66,892);
+INSERT INTO tournament_entry VALUES(6,'MW02',NULL,NULL,83,752);
+INSERT INTO tournament_entry VALUES(6,'MW18',NULL,'Q',149,386);
+INSERT INTO tournament_entry VALUES(6,'N0AE',28,NULL,29,1675);
+INSERT INTO tournament_entry VALUES(6,'N0BG',NULL,'WC',95,632);
+INSERT INTO tournament_entry VALUES(6,'N0BS',NULL,NULL,99,600);
+INSERT INTO tournament_entry VALUES(6,'N732',NULL,NULL,74,833);
+INSERT INTO tournament_entry VALUES(6,'N771',NULL,'LL',91,667);
+INSERT INTO tournament_entry VALUES(6,'O483',NULL,NULL,81,765);
+INSERT INTO tournament_entry VALUES(6,'O513',NULL,'Q',143,398);
+INSERT INTO tournament_entry VALUES(6,'O522',NULL,'PR',94,634);
+INSERT INTO tournament_entry VALUES(6,'P09Z',24,NULL,25,1860);
+INSERT INTO tournament_entry VALUES(6,'P0CT',NULL,'WC',101,593);
+INSERT INTO tournament_entry VALUES(6,'PL56',11,NULL,12,3210);
+INSERT INTO tournament_entry VALUES(6,'R0DG',9,NULL,10,3440);
+INSERT INTO tournament_entry VALUES(6,'RC91',NULL,NULL,75,826);
+INSERT INTO tournament_entry VALUES(6,'RE44',16,NULL,17,2580);
+INSERT INTO tournament_entry VALUES(6,'RH16',6,NULL,7,3715);
+INSERT INTO tournament_entry VALUES(6,'S0AG',1,NULL,1,9730);
+INSERT INTO tournament_entry VALUES(6,'S0H2',NULL,'Q',97,605);
+INSERT INTO tournament_entry VALUES(6,'S0S1',12,NULL,13,3020);
+INSERT INTO tournament_entry VALUES(6,'SU55',27,NULL,28,1726);
+INSERT INTO tournament_entry VALUES(6,'SU87',NULL,NULL,44,1245);
+INSERT INTO tournament_entry VALUES(6,'SX50',NULL,NULL,77,816);
+INSERT INTO tournament_entry VALUES(6,'SX91',NULL,'Q',120,493);
+INSERT INTO tournament_entry VALUES(6,'T0AP',NULL,'Q',102,593);
+INSERT INTO tournament_entry VALUES(6,'T0HA',NULL,NULL,70,878);
+INSERT INTO tournament_entry VALUES(6,'TC61',NULL,NULL,41,1355);
+INSERT INTO tournament_entry VALUES(6,'TD51',15,NULL,16,2640);
+INSERT INTO tournament_entry VALUES(6,'TE16',NULL,'Q',139,417);
+INSERT INTO tournament_entry VALUES(6,'TE51',18,NULL,19,2420);
+INSERT INTO tournament_entry VALUES(6,'U182',NULL,NULL,60,944);
+INSERT INTO tournament_entry VALUES(6,'V0AM',NULL,'Q',130,455);
+INSERT INTO tournament_entry VALUES(6,'V832',NULL,NULL,79,792);
+INSERT INTO tournament_entry VALUES(6,'Y09V',NULL,NULL,73,857);
+INSERT INTO tournament_entry VALUES(6,'Z355',2,NULL,2,8085);
+INSERT INTO tournament_entry VALUES(7,'A0FC',32,NULL,41,1265);
+INSERT INTO tournament_entry VALUES(7,'A0GC',NULL,NULL,132,458);
+INSERT INTO tournament_entry VALUES(7,'A0K3',NULL,'WC',638,51);
+INSERT INTO tournament_entry VALUES(7,'AE14',NULL,NULL,58,973);
+INSERT INTO tournament_entry VALUES(7,'AG37',21,NULL,28,1865);
+INSERT INTO tournament_entry VALUES(7,'B0CD',NULL,'PR',102,627);
+INSERT INTO tournament_entry VALUES(7,'B0EJ',NULL,'Q',123,480);
+INSERT INTO tournament_entry VALUES(7,'B0GG',NULL,NULL,72,871);
+INSERT INTO tournament_entry VALUES(7,'B0PG',NULL,'Q',121,492);
+INSERT INTO tournament_entry VALUES(7,'BF23',NULL,'Q',689,44);
+INSERT INTO tournament_entry VALUES(7,'BM95',NULL,NULL,66,905);
+INSERT INTO tournament_entry VALUES(7,'BS86',NULL,'Q',143,425);
+INSERT INTO tournament_entry VALUES(7,'BT72',30,NULL,42,1265);
+INSERT INTO tournament_entry VALUES(7,'BU13',NULL,NULL,52,1049);
+INSERT INTO tournament_entry VALUES(7,'BV16',NULL,'Q',231,243);
+INSERT INTO tournament_entry VALUES(7,'C0AU',14,NULL,24,2085);
+INSERT INTO tournament_entry VALUES(7,'C0DF',NULL,NULL,71,874);
+INSERT INTO tournament_entry VALUES(7,'C0E9',13,NULL,17,2385);
+INSERT INTO tournament_entry VALUES(7,'CD85',NULL,NULL,93,662);
+INSERT INTO tournament_entry VALUES(7,'CF59',NULL,NULL,89,690);
+INSERT INTO tournament_entry VALUES(7,'CG80',NULL,NULL,92,680);
+INSERT INTO tournament_entry VALUES(7,'D0DP',NULL,'WC',113,548);
+INSERT INTO tournament_entry VALUES(7,'D0F6',27,NULL,36,1333);
+INSERT INTO tournament_entry VALUES(7,'D923',NULL,NULL,54,1028);
+INSERT INTO tournament_entry VALUES(7,'D994',NULL,'Q',106,600);
+INSERT INTO tournament_entry VALUES(7,'DA31',NULL,NULL,98,654);
+INSERT INTO tournament_entry VALUES(7,'DH50',20,NULL,19,2225);
+INSERT INTO tournament_entry VALUES(7,'DH58',9,NULL,8,3335);
+INSERT INTO tournament_entry VALUES(7,'EA24',NULL,NULL,60,960);
+INSERT INTO tournament_entry VALUES(7,'F0BY',NULL,NULL,55,1007);
+INSERT INTO tournament_entry VALUES(7,'F0F1',15,NULL,21,2130);
+INSERT INTO tournament_entry VALUES(7,'F0FV',NULL,NULL,49,1110);
+INSERT INTO tournament_entry VALUES(7,'FA43',NULL,'Q',140,435);
+INSERT INTO tournament_entry VALUES(7,'FB98',2,NULL,4,5135);
+INSERT INTO tournament_entry VALUES(7,'G09O',NULL,NULL,126,473);
+INSERT INTO tournament_entry VALUES(7,'G0GD',NULL,'WC',125,476);
+INSERT INTO tournament_entry VALUES(7,'GB88',NULL,NULL,65,914);
+INSERT INTO tournament_entry VALUES(7,'GC88',NULL,NULL,59,960);
+INSERT INTO tournament_entry VALUES(7,'GJ37',24,NULL,31,1715);
+INSERT INTO tournament_entry VALUES(7,'GK06',NULL,'WC',193,285);
+INSERT INTO tournament_entry VALUES(7,'H996',NULL,'Q',142,431);
+INSERT INTO tournament_entry VALUES(7,'HB64',NULL,NULL,69,886);
+INSERT INTO tournament_entry VALUES(7,'K0AZ',NULL,NULL,62,929);
+INSERT INTO tournament_entry VALUES(7,'KE29',11,NULL,16,2590);
+INSERT INTO tournament_entry VALUES(7,'KI82',NULL,NULL,80,756);
+INSERT INTO tournament_entry VALUES(7,'KI95',NULL,NULL,50,1106);
+INSERT INTO tournament_entry VALUES(7,'L0BV',19,NULL,27,2015);
+INSERT INTO tournament_entry VALUES(7,'M0C2',NULL,'Q',NULL,NULL);
+INSERT INTO tournament_entry VALUES(7,'M0CI',NULL,NULL,56,1005);
+INSERT INTO tournament_entry VALUES(7,'M0EJ',3,NULL,10,3195);
+INSERT INTO tournament_entry VALUES(7,'M0FH',16,NULL,22,2110);
+INSERT INTO tournament_entry VALUES(7,'M0GZ',NULL,NULL,43,1205);
+INSERT INTO tournament_entry VALUES(7,'M0HU',NULL,'Q',122,491);
+INSERT INTO tournament_entry VALUES(7,'M0NI',12,NULL,18,2362);
+INSERT INTO tournament_entry VALUES(7,'M0QI',26,NULL,34,1555);
+INSERT INTO tournament_entry VALUES(7,'MC65',NULL,NULL,48,1115);
+INSERT INTO tournament_entry VALUES(7,'ME82',NULL,'Q',94,661);
+INSERT INTO tournament_entry VALUES(7,'MK66',NULL,NULL,96,655);
+INSERT INTO tournament_entry VALUES(7,'MM58',10,NULL,14,2720);
+INSERT INTO tournament_entry VALUES(7,'MO44',NULL,NULL,68,890);
+INSERT INTO tournament_entry VALUES(7,'MP20',29,NULL,40,1271);
+INSERT INTO tournament_entry VALUES(7,'MU94',NULL,NULL,51,1087);
+INSERT INTO tournament_entry VALUES(7,'MW02',NULL,NULL,46,1139);
+INSERT INTO tournament_entry VALUES(7,'N0AE',25,NULL,32,1700);
+INSERT INTO tournament_entry VALUES(7,'N0AM',NULL,'Q',114,539);
+INSERT INTO tournament_entry VALUES(7,'N732',NULL,NULL,131,459);
+INSERT INTO tournament_entry VALUES(7,'N771',31,NULL,39,1277);
+INSERT INTO tournament_entry VALUES(7,'O483',NULL,NULL,78,775);
+INSERT INTO tournament_entry VALUES(7,'O513',NULL,'PR',141,433);
+INSERT INTO tournament_entry VALUES(7,'O522',NULL,NULL,74,827);
+INSERT INTO tournament_entry VALUES(7,'P09Z',18,NULL,26,2050);
+INSERT INTO tournament_entry VALUES(7,'PD07',NULL,'WC',1250,6);
+INSERT INTO tournament_entry VALUES(7,'Q02L',NULL,NULL,86,726);
+INSERT INTO tournament_entry VALUES(7,'R0DG',5,NULL,9,3250);
+INSERT INTO tournament_entry VALUES(7,'R0EB',NULL,'Q',111,579);
+INSERT INTO tournament_entry VALUES(7,'RC91',NULL,NULL,64,914);
+INSERT INTO tournament_entry VALUES(7,'RE44',6,NULL,11,3110);
+INSERT INTO tournament_entry VALUES(7,'RH16',8,NULL,13,2905);
+INSERT INTO tournament_entry VALUES(7,'S0GD',NULL,'LL',120,514);
+INSERT INTO tournament_entry VALUES(7,'S0N0',NULL,'Q',103,616);
+INSERT INTO tournament_entry VALUES(7,'S0RE',NULL,NULL,109,580);
+INSERT INTO tournament_entry VALUES(7,'S0S1',4,NULL,7,3520);
+INSERT INTO tournament_entry VALUES(7,'S0ZE',NULL,'Q',136,448);
+INSERT INTO tournament_entry VALUES(7,'SU55',22,NULL,29,1836);
+INSERT INTO tournament_entry VALUES(7,'SU87',28,NULL,38,1281);
+INSERT INTO tournament_entry VALUES(7,'SX50',NULL,NULL,82,741);
+INSERT INTO tournament_entry VALUES(7,'T0AP',NULL,'LL',107,599);
+INSERT INTO tournament_entry VALUES(7,'T0HA',NULL,NULL,61,940);
+INSERT INTO tournament_entry VALUES(7,'TD51',7,NULL,12,2990);
+INSERT INTO tournament_entry VALUES(7,'TE51',23,NULL,30,1825);
+INSERT INTO tournament_entry VALUES(7,'U182',NULL,NULL,47,1133);
+INSERT INTO tournament_entry VALUES(7,'V832',NULL,NULL,99,639);
+INSERT INTO tournament_entry VALUES(7,'W09E',NULL,NULL,88,706);
+INSERT INTO tournament_entry VALUES(7,'WB08',NULL,'Q',158,358);
+INSERT INTO tournament_entry VALUES(7,'Y09V',NULL,NULL,76,793);
+INSERT INTO tournament_entry VALUES(7,'Z355',1,NULL,3,6030);
+INSERT INTO tournament_entry VALUES(8,'A0E2',2,NULL,2,8600);
+INSERT INTO tournament_entry VALUES(8,'A0FC',NULL,NULL,41,1265);
+INSERT INTO tournament_entry VALUES(8,'A0GC',NULL,NULL,132,458);
+INSERT INTO tournament_entry VALUES(8,'AE14',NULL,NULL,58,973);
+INSERT INTO tournament_entry VALUES(8,'AG37',23,NULL,28,1865);
+INSERT INTO tournament_entry VALUES(8,'B0BI',NULL,NULL,45,1180);
+INSERT INTO tournament_entry VALUES(8,'B0CD',NULL,NULL,102,627);
+INSERT INTO tournament_entry VALUES(8,'B0EJ',NULL,NULL,123,480);
+INSERT INTO tournament_entry VALUES(8,'B0GG',NULL,NULL,72,871);
+INSERT INTO tournament_entry VALUES(8,'B0NN',NULL,NULL,110,580);
+INSERT INTO tournament_entry VALUES(8,'B0PG',NULL,NULL,121,492);
+INSERT INTO tournament_entry VALUES(8,'BD06',NULL,NULL,53,1046);
+INSERT INTO tournament_entry VALUES(8,'BM95',NULL,NULL,66,905);
+INSERT INTO tournament_entry VALUES(8,'BT72',NULL,NULL,42,1265);
+INSERT INTO tournament_entry VALUES(8,'BU13',NULL,NULL,52,1049);
+INSERT INTO tournament_entry VALUES(8,'C0DF',NULL,NULL,71,874);
+INSERT INTO tournament_entry VALUES(8,'C0E9',15,NULL,17,2385);
+INSERT INTO tournament_entry VALUES(8,'C0H0',NULL,NULL,75,800);
+INSERT INTO tournament_entry VALUES(8,'CF59',NULL,NULL,89,690);
+INSERT INTO tournament_entry VALUES(8,'CG80',NULL,NULL,92,680);
+INSERT INTO tournament_entry VALUES(8,'D0F6',30,NULL,36,1333);
+INSERT INTO tournament_entry VALUES(8,'D0FJ',29,NULL,35,1414);
+INSERT INTO tournament_entry VALUES(8,'D923',NULL,NULL,54,1028);
+INSERT INTO tournament_entry VALUES(8,'DA31',NULL,NULL,98,654);
+INSERT INTO tournament_entry VALUES(8,'DH50',17,NULL,19,2225);
+INSERT INTO tournament_entry VALUES(8,'DH58',6,NULL,8,3335);
+INSERT INTO tournament_entry VALUES(8,'EA24',NULL,NULL,60,960);
+INSERT INTO tournament_entry VALUES(8,'F0BY',NULL,NULL,55,1007);
+INSERT INTO tournament_entry VALUES(8,'F0FV',NULL,NULL,49,1110);
+INSERT INTO tournament_entry VALUES(8,'FB98',4,NULL,4,5135);
+INSERT INTO tournament_entry VALUES(8,'G09O',NULL,NULL,126,473);
+INSERT INTO tournament_entry VALUES(8,'GB88',NULL,NULL,65,914);
+INSERT INTO tournament_entry VALUES(8,'GC88',NULL,NULL,59,960);
+INSERT INTO tournament_entry VALUES(8,'GE33',NULL,NULL,134,455);
+INSERT INTO tournament_entry VALUES(8,'GJ37',26,NULL,31,1715);
+INSERT INTO tournament_entry VALUES(8,'H09P',NULL,NULL,108,594);
+INSERT INTO tournament_entry VALUES(8,'HH26',20,NULL,23,2095);
+INSERT INTO tournament_entry VALUES(8,'J551',NULL,NULL,100,638);
+INSERT INTO tournament_entry VALUES(8,'K0A3',NULL,NULL,213,258);
+INSERT INTO tournament_entry VALUES(8,'K0AZ',NULL,NULL,62,929);
+INSERT INTO tournament_entry VALUES(8,'KE29',14,NULL,16,2590);
+INSERT INTO tournament_entry VALUES(8,'KI82',NULL,NULL,80,756);
+INSERT INTO tournament_entry VALUES(8,'KI95',NULL,NULL,50,1106);
+INSERT INTO tournament_entry VALUES(8,'L0BV',22,NULL,27,2015);
+INSERT INTO tournament_entry VALUES(8,'L0IL',NULL,NULL,137,440);
+INSERT INTO tournament_entry VALUES(8,'M0CI',NULL,NULL,56,1005);
+INSERT INTO tournament_entry VALUES(8,'M0EJ',8,NULL,10,3195);
+INSERT INTO tournament_entry VALUES(8,'M0FH',19,NULL,22,2110);
+INSERT INTO tournament_entry VALUES(8,'M0GZ',NULL,NULL,43,1205);
+INSERT INTO tournament_entry VALUES(8,'M0JF',NULL,NULL,73,869);
+INSERT INTO tournament_entry VALUES(8,'M0NI',16,NULL,18,2362);
+INSERT INTO tournament_entry VALUES(8,'M0QI',28,NULL,34,1555);
+INSERT INTO tournament_entry VALUES(8,'ME82',NULL,NULL,94,661);
+INSERT INTO tournament_entry VALUES(8,'MK66',NULL,NULL,96,655);
+INSERT INTO tournament_entry VALUES(8,'MM58',12,NULL,14,2720);
+INSERT INTO tournament_entry VALUES(8,'MO44',NULL,NULL,68,890);
+INSERT INTO tournament_entry VALUES(8,'MP20',NULL,NULL,40,1271);
+INSERT INTO tournament_entry VALUES(8,'MU94',NULL,NULL,51,1087);
+INSERT INTO tournament_entry VALUES(8,'MW02',NULL,NULL,46,1139);
+INSERT INTO tournament_entry VALUES(8,'N0AE',27,NULL,32,1700);
+INSERT INTO tournament_entry VALUES(8,'N0AM',NULL,NULL,114,539);
+INSERT INTO tournament_entry VALUES(8,'N0BG',NULL,NULL,97,655);
+INSERT INTO tournament_entry VALUES(8,'N0BS',NULL,NULL,77,785);
+INSERT INTO tournament_entry VALUES(8,'N552',NULL,NULL,67,893);
+INSERT INTO tournament_entry VALUES(8,'N732',NULL,NULL,131,459);
+INSERT INTO tournament_entry VALUES(8,'N771',32,NULL,39,1277);
+INSERT INTO tournament_entry VALUES(8,'O513',NULL,NULL,141,433);
+INSERT INTO tournament_entry VALUES(8,'O522',NULL,NULL,74,827);
+INSERT INTO tournament_entry VALUES(8,'P09Z',21,NULL,26,2050);
+INSERT INTO tournament_entry VALUES(8,'PL56',13,NULL,15,2620);
+INSERT INTO tournament_entry VALUES(8,'Q02L',NULL,NULL,86,726);
+INSERT INTO tournament_entry VALUES(8,'R0DG',7,NULL,9,3250);
+INSERT INTO tournament_entry VALUES(8,'R0EB',NULL,NULL,111,579);
+INSERT INTO tournament_entry VALUES(8,'R0FS',NULL,NULL,487,82);
+INSERT INTO tournament_entry VALUES(8,'RC91',NULL,NULL,64,914);
+INSERT INTO tournament_entry VALUES(8,'RE44',9,NULL,11,3110);
+INSERT INTO tournament_entry VALUES(8,'RH16',11,NULL,13,2905);
+INSERT INTO tournament_entry VALUES(8,'S0AG',1,NULL,1,12030);
+INSERT INTO tournament_entry VALUES(8,'S0RE',NULL,NULL,109,580);
+INSERT INTO tournament_entry VALUES(8,'S0S1',5,NULL,7,3520);
+INSERT INTO tournament_entry VALUES(8,'S0ZE',NULL,NULL,136,448);
+INSERT INTO tournament_entry VALUES(8,'SU55',24,NULL,29,1836);
+INSERT INTO tournament_entry VALUES(8,'SU87',31,NULL,38,1281);
+INSERT INTO tournament_entry VALUES(8,'SX50',NULL,NULL,82,741);
+INSERT INTO tournament_entry VALUES(8,'T0A1',NULL,NULL,130,461);
+INSERT INTO tournament_entry VALUES(8,'T0HA',NULL,NULL,61,940);
+INSERT INTO tournament_entry VALUES(8,'TC61',NULL,NULL,44,1185);
+INSERT INTO tournament_entry VALUES(8,'TD51',10,NULL,12,2990);
+INSERT INTO tournament_entry VALUES(8,'TE30',NULL,NULL,104,605);
+INSERT INTO tournament_entry VALUES(8,'TE51',25,NULL,30,1825);
+INSERT INTO tournament_entry VALUES(8,'U182',NULL,NULL,47,1133);
+INSERT INTO tournament_entry VALUES(8,'V832',NULL,NULL,99,639);
+INSERT INTO tournament_entry VALUES(8,'W09E',NULL,NULL,88,706);
+INSERT INTO tournament_entry VALUES(8,'W0BH',NULL,NULL,168,323);
+INSERT INTO tournament_entry VALUES(8,'Y09V',NULL,NULL,76,793);
+INSERT INTO tournament_entry VALUES(8,'Z355',3,NULL,3,6030);
+INSERT INTO tournament_entry VALUES(9,'A0FC',NULL,NULL,73,825);
+INSERT INTO tournament_entry VALUES(9,'A0GC',NULL,NULL,68,839);
+INSERT INTO tournament_entry VALUES(9,'AE14',NULL,NULL,50,1003);
+INSERT INTO tournament_entry VALUES(9,'AG37',12,NULL,13,2755);
+INSERT INTO tournament_entry VALUES(9,'B0BI',NULL,NULL,41,1135);
+INSERT INTO tournament_entry VALUES(9,'B0CD',NULL,NULL,86,737);
+INSERT INTO tournament_entry VALUES(9,'B0GG',NULL,NULL,64,869);
+INSERT INTO tournament_entry VALUES(9,'BG23',NULL,NULL,104,617);
+INSERT INTO tournament_entry VALUES(9,'BK40',NULL,NULL,56,925);
+INSERT INTO tournament_entry VALUES(9,'BK92',14,NULL,16,2445);
+INSERT INTO tournament_entry VALUES(9,'BM95',NULL,NULL,47,1083);
+INSERT INTO tournament_entry VALUES(9,'BT72',NULL,NULL,51,995);
+INSERT INTO tournament_entry VALUES(9,'BU13',NULL,NULL,45,1089);
+INSERT INTO tournament_entry VALUES(9,'BV16',NULL,NULL,149,390);
+INSERT INTO tournament_entry VALUES(9,'C0AU',19,NULL,21,2135);
+INSERT INTO tournament_entry VALUES(9,'C0C8',NULL,NULL,71,829);
+INSERT INTO tournament_entry VALUES(9,'C0DF',NULL,NULL,59,912);
+INSERT INTO tournament_entry VALUES(9,'C0E9',22,NULL,25,2040);
+INSERT INTO tournament_entry VALUES(9,'C0H0',NULL,NULL,80,782);
+INSERT INTO tournament_entry VALUES(9,'C977',NULL,NULL,97,664);
+INSERT INTO tournament_entry VALUES(9,'D0C1',NULL,NULL,79,784);
+INSERT INTO tournament_entry VALUES(9,'D0F6',31,NULL,35,1308);
+INSERT INTO tournament_entry VALUES(9,'D0FJ',26,NULL,30,1584);
+INSERT INTO tournament_entry VALUES(9,'D643',4,NULL,4,4830);
+INSERT INTO tournament_entry VALUES(9,'D923',NULL,NULL,66,868);
+INSERT INTO tournament_entry VALUES(9,'DB63',NULL,NULL,83,766);
+INSERT INTO tournament_entry VALUES(9,'DH50',18,NULL,20,2225);
+INSERT INTO tournament_entry VALUES(9,'DH58',7,NULL,8,3545);
+INSERT INTO tournament_entry VALUES(9,'F724',NULL,NULL,58,916);
+INSERT INTO tournament_entry VALUES(9,'FB98',5,NULL,5,4675);
+INSERT INTO tournament_entry VALUES(9,'GB88',NULL,NULL,87,734);
+INSERT INTO tournament_entry VALUES(9,'GC88',NULL,NULL,48,1040);
+INSERT INTO tournament_entry VALUES(9,'GJ37',27,NULL,31,1565);
+INSERT INTO tournament_entry VALUES(9,'H09N',NULL,NULL,176,315);
+INSERT INTO tournament_entry VALUES(9,'H997',NULL,NULL,159,369);
+INSERT INTO tournament_entry VALUES(9,'HB64',NULL,NULL,75,806);
+INSERT INTO tournament_entry VALUES(9,'HH26',21,NULL,24,2045);
+INSERT INTO tournament_entry VALUES(9,'K0AH',NULL,NULL,74,820);
+INSERT INTO tournament_entry VALUES(9,'K0AZ',NULL,NULL,67,862);
+INSERT INTO tournament_entry VALUES(9,'KE29',9,NULL,10,3280);
+INSERT INTO tournament_entry VALUES(9,'KI95',NULL,NULL,46,1086);
+INSERT INTO tournament_entry VALUES(9,'L0BV',15,NULL,17,2415);
+INSERT INTO tournament_entry VALUES(9,'M0CI',NULL,NULL,57,920);
+INSERT INTO tournament_entry VALUES(9,'M0EJ',8,NULL,9,3505);
+INSERT INTO tournament_entry VALUES(9,'M0FH',20,NULL,22,2110);
+INSERT INTO tournament_entry VALUES(9,'M0GZ',32,NULL,36,1275);
+INSERT INTO tournament_entry VALUES(9,'M0JF',NULL,NULL,63,883);
+INSERT INTO tournament_entry VALUES(9,'M0NI',17,NULL,19,2380);
+INSERT INTO tournament_entry VALUES(9,'M0QI',28,NULL,32,1485);
+INSERT INTO tournament_entry VALUES(9,'ME82',NULL,NULL,60,897);
+INSERT INTO tournament_entry VALUES(9,'MK66',NULL,NULL,96,667);
+INSERT INTO tournament_entry VALUES(9,'MM58',16,NULL,18,2410);
+INSERT INTO tournament_entry VALUES(9,'MO44',NULL,NULL,70,833);
+INSERT INTO tournament_entry VALUES(9,'MP20',NULL,NULL,38,1168);
+INSERT INTO tournament_entry VALUES(9,'MQ75',NULL,NULL,65,868);
+INSERT INTO tournament_entry VALUES(9,'MU94',NULL,NULL,40,1138);
+INSERT INTO tournament_entry VALUES(9,'MW02',NULL,NULL,37,1233);
+INSERT INTO tournament_entry VALUES(9,'N0AE',29,NULL,33,1420);
+INSERT INTO tournament_entry VALUES(9,'N0BG',NULL,NULL,85,740);
+INSERT INTO tournament_entry VALUES(9,'N0BS',NULL,NULL,82,770);
+INSERT INTO tournament_entry VALUES(9,'N732',NULL,NULL,157,374);
+INSERT INTO tournament_entry VALUES(9,'N771',30,NULL,34,1397);
+INSERT INTO tournament_entry VALUES(9,'O483',NULL,NULL,103,644);
+INSERT INTO tournament_entry VALUES(9,'O513',NULL,NULL,137,453);
+INSERT INTO tournament_entry VALUES(9,'O522',NULL,NULL,61,895);
+INSERT INTO tournament_entry VALUES(9,'Q02L',NULL,NULL,81,773);
+INSERT INTO tournament_entry VALUES(9,'R0DG',10,NULL,11,3090);
+INSERT INTO tournament_entry VALUES(9,'R0EB',NULL,NULL,76,805);
+INSERT INTO tournament_entry VALUES(9,'RC91',NULL,NULL,54,932);
+INSERT INTO tournament_entry VALUES(9,'RE44',13,NULL,14,2610);
+INSERT INTO tournament_entry VALUES(9,'RH16',11,NULL,12,2755);
+INSERT INTO tournament_entry VALUES(9,'S0AG',2,NULL,2,10780);
+INSERT INTO tournament_entry VALUES(9,'S0GD',NULL,NULL,91,691);
+INSERT INTO tournament_entry VALUES(9,'S0H2',NULL,NULL,88,727);
+INSERT INTO tournament_entry VALUES(9,'S0N0',NULL,NULL,100,654);
+INSERT INTO tournament_entry VALUES(9,'S0RE',NULL,NULL,238,235);
+INSERT INTO tournament_entry VALUES(9,'S0S1',6,NULL,6,4280);
+INSERT INTO tournament_entry VALUES(9,'S0UV',NULL,NULL,190,279);
+INSERT INTO tournament_entry VALUES(9,'SU55',23,NULL,26,1838);
+INSERT INTO tournament_entry VALUES(9,'SU87',NULL,NULL,44,1105);
+INSERT INTO tournament_entry VALUES(9,'T0BW',NULL,NULL,212,255);
+INSERT INTO tournament_entry VALUES(9,'T0HA',NULL,NULL,52,985);
+INSERT INTO tournament_entry VALUES(9,'TC61',NULL,NULL,78,795);
+INSERT INTO tournament_entry VALUES(9,'TD51',25,NULL,29,1640);
+INSERT INTO tournament_entry VALUES(9,'TE30',NULL,NULL,72,826);
+INSERT INTO tournament_entry VALUES(9,'U182',NULL,NULL,43,1123);
+INSERT INTO tournament_entry VALUES(9,'V812',NULL,NULL,84,759);
+INSERT INTO tournament_entry VALUES(9,'V832',NULL,NULL,95,668);
+INSERT INTO tournament_entry VALUES(9,'VA25',NULL,NULL,202,263);
+INSERT INTO tournament_entry VALUES(9,'W09E',NULL,NULL,77,803);
+INSERT INTO tournament_entry VALUES(9,'W367',NULL,NULL,129,502);
+INSERT INTO tournament_entry VALUES(9,'WB32',NULL,NULL,158,372);
+INSERT INTO tournament_entry VALUES(9,'Y09V',NULL,NULL,89,721);
+INSERT INTO tournament_entry VALUES(9,'Z0CQ',NULL,NULL,305,170);
+INSERT INTO tournament_entry VALUES(9,'Z355',3,NULL,3,5930);
+INSERT INTO tournament_entry VALUES(9,'Z371',NULL,NULL,370,135);
+INSERT INTO tournament_entry VALUES(10,'A0E2',2,NULL,2,8850);
+INSERT INTO tournament_entry VALUES(10,'A0FC',NULL,NULL,36,1415);
+INSERT INTO tournament_entry VALUES(10,'A0GC',NULL,'WC',121,477);
+INSERT INTO tournament_entry VALUES(10,'AE14',NULL,NULL,66,906);
+INSERT INTO tournament_entry VALUES(10,'AG37',29,NULL,27,1875);
+INSERT INTO tournament_entry VALUES(10,'B0BI',NULL,NULL,38,1410);
+INSERT INTO tournament_entry VALUES(10,'B0CD',NULL,NULL,161,347);
+INSERT INTO tournament_entry VALUES(10,'B0GG',NULL,NULL,68,891);
+INSERT INTO tournament_entry VALUES(10,'BD06',NULL,NULL,49,1064);
+INSERT INTO tournament_entry VALUES(10,'BG23',NULL,'Q',133,449);
+INSERT INTO tournament_entry VALUES(10,'BK92',NULL,NULL,62,915);
+INSERT INTO tournament_entry VALUES(10,'BM95',NULL,NULL,60,943);
+INSERT INTO tournament_entry VALUES(10,'BT72',NULL,NULL,41,1285);
+INSERT INTO tournament_entry VALUES(10,'BU13',NULL,NULL,50,1051);
+INSERT INTO tournament_entry VALUES(10,'BV16',NULL,'Q',193,289);
+INSERT INTO tournament_entry VALUES(10,'C0AU',18,NULL,18,2475);
+INSERT INTO tournament_entry VALUES(10,'C0C8',NULL,'Q',109,530);
+INSERT INTO tournament_entry VALUES(10,'C0DF',NULL,NULL,64,911);
+INSERT INTO tournament_entry VALUES(10,'C0E9',NULL,NULL,26,1920);
+INSERT INTO tournament_entry VALUES(10,'C0H0',NULL,'WC',113,508);
+INSERT INTO tournament_entry VALUES(10,'C977',NULL,'LL',104,563);
+INSERT INTO tournament_entry VALUES(10,'CD85',NULL,NULL,99,615);
+INSERT INTO tournament_entry VALUES(10,'D0C1',NULL,NULL,88,690);
+INSERT INTO tournament_entry VALUES(10,'D0CO',5,NULL,5,4610);
+INSERT INTO tournament_entry VALUES(10,'D0F6',NULL,NULL,54,997);
+INSERT INTO tournament_entry VALUES(10,'D0FJ',NULL,NULL,45,1159);
+INSERT INTO tournament_entry VALUES(10,'D643',6,NULL,6,4230);
+INSERT INTO tournament_entry VALUES(10,'D875',16,NULL,17,2595);
+INSERT INTO tournament_entry VALUES(10,'D923',NULL,NULL,69,875);
+INSERT INTO tournament_entry VALUES(10,'D994',NULL,NULL,92,651);
+INSERT INTO tournament_entry VALUES(10,'DA31',NULL,NULL,90,656);
+INSERT INTO tournament_entry VALUES(10,'DB63',NULL,NULL,59,952);
+INSERT INTO tournament_entry VALUES(10,'DH50',26,NULL,29,1770);
+INSERT INTO tournament_entry VALUES(10,'DH58',9,NULL,9,3635);
+INSERT INTO tournament_entry VALUES(10,'EA24',NULL,NULL,53,1025);
+INSERT INTO tournament_entry VALUES(10,'F0BY',NULL,NULL,55,991);
+INSERT INTO tournament_entry VALUES(10,'F0F1',14,NULL,14,2845);
+INSERT INTO tournament_entry VALUES(10,'F0F2',NULL,NULL,115,493);
+INSERT INTO tournament_entry VALUES(10,'F0FV',NULL,NULL,65,907);
+INSERT INTO tournament_entry VALUES(10,'F724',NULL,NULL,124,468);
+INSERT INTO tournament_entry VALUES(10,'FB98',4,NULL,4,4675);
+INSERT INTO tournament_entry VALUES(10,'G09O',NULL,NULL,83,753);
+INSERT INTO tournament_entry VALUES(10,'G0GD',NULL,'Q',167,338);
+INSERT INTO tournament_entry VALUES(10,'G628',NULL,'WC',166,339);
+INSERT INTO tournament_entry VALUES(10,'GC88',NULL,NULL,43,1265);
+INSERT INTO tournament_entry VALUES(10,'GE33',NULL,'LL',122,477);
+INSERT INTO tournament_entry VALUES(10,'GJ16',NULL,'LL',144,405);
+INSERT INTO tournament_entry VALUES(10,'GJ37',NULL,NULL,35,1485);
+INSERT INTO tournament_entry VALUES(10,'H0BH',NULL,NULL,78,792);
+INSERT INTO tournament_entry VALUES(10,'H996',NULL,'WC',147,399);
+INSERT INTO tournament_entry VALUES(10,'H997',NULL,'Q',142,410);
+INSERT INTO tournament_entry VALUES(10,'HB64',NULL,NULL,52,1039);
+INSERT INTO tournament_entry VALUES(10,'HB71',30,NULL,28,1830);
+INSERT INTO tournament_entry VALUES(10,'HG86',NULL,'Q',227,244);
+INSERT INTO tournament_entry VALUES(10,'HG94',NULL,'Q',220,253);
+INSERT INTO tournament_entry VALUES(10,'HH26',22,NULL,21,2155);
+INSERT INTO tournament_entry VALUES(10,'J0AZ',NULL,'Q',150,388);
+INSERT INTO tournament_entry VALUES(10,'J551',NULL,NULL,149,390);
+INSERT INTO tournament_entry VALUES(10,'K0AH',23,NULL,23,2020);
+INSERT INTO tournament_entry VALUES(10,'K0AZ',NULL,NULL,76,799);
+INSERT INTO tournament_entry VALUES(10,'KE29',24,NULL,24,1960);
+INSERT INTO tournament_entry VALUES(10,'KI82',NULL,NULL,86,715);
+INSERT INTO tournament_entry VALUES(10,'KI95',NULL,NULL,46,1146);
+INSERT INTO tournament_entry VALUES(10,'L0BV',NULL,NULL,34,1505);
+INSERT INTO tournament_entry VALUES(10,'L0CX',NULL,'Q',872,22);
+INSERT INTO tournament_entry VALUES(10,'L987',NULL,NULL,125,466);
+INSERT INTO tournament_entry VALUES(10,'M0CI',NULL,NULL,56,990);
+INSERT INTO tournament_entry VALUES(10,'M0EJ',8,NULL,7,3860);
+INSERT INTO tournament_entry VALUES(10,'M0FH',21,NULL,22,2110);
+INSERT INTO tournament_entry VALUES(10,'M0GZ',31,NULL,37,1414);
+INSERT INTO tournament_entry VALUES(10,'M0JF',NULL,NULL,74,811);
+INSERT INTO tournament_entry VALUES(10,'M0JZ',NULL,'Q',153,374);
+INSERT INTO tournament_entry VALUES(10,'M0K4',NULL,'LL',112,511);
+INSERT INTO tournament_entry VALUES(10,'M0NI',19,NULL,19,2272);
+INSERT INTO tournament_entry VALUES(10,'M0QI',32,NULL,33,1550);
+INSERT INTO tournament_entry VALUES(10,'MC65',NULL,NULL,42,1265);
+INSERT INTO tournament_entry VALUES(10,'MJ08',NULL,NULL,131,454);
+INSERT INTO tournament_entry VALUES(10,'MK66',NULL,NULL,98,617);
+INSERT INTO tournament_entry VALUES(10,'MM58',11,NULL,11,3290);
+INSERT INTO tournament_entry VALUES(10,'MN13',NULL,'Q',239,233);
+INSERT INTO tournament_entry VALUES(10,'MO44',NULL,NULL,48,1070);
+INSERT INTO tournament_entry VALUES(10,'MP20',NULL,NULL,39,1388);
+INSERT INTO tournament_entry VALUES(10,'MQ75',NULL,NULL,96,645);
+INSERT INTO tournament_entry VALUES(10,'MU94',NULL,NULL,57,962);
+INSERT INTO tournament_entry VALUES(10,'MW02',NULL,NULL,73,812);
+INSERT INTO tournament_entry VALUES(10,'N0AE',28,NULL,32,1690);
+INSERT INTO tournament_entry VALUES(10,'N0AM',NULL,'WC',137,433);
+INSERT INTO tournament_entry VALUES(10,'N0BG',NULL,NULL,95,645);
+INSERT INTO tournament_entry VALUES(10,'N0BS',NULL,NULL,97,620);
+INSERT INTO tournament_entry VALUES(10,'N732',NULL,NULL,77,794);
+INSERT INTO tournament_entry VALUES(10,'N771',NULL,NULL,81,762);
+INSERT INTO tournament_entry VALUES(10,'O483',NULL,NULL,82,762);
+INSERT INTO tournament_entry VALUES(10,'O513',NULL,NULL,108,533);
+INSERT INTO tournament_entry VALUES(10,'O522',NULL,NULL,93,651);
+INSERT INTO tournament_entry VALUES(10,'P09Z',25,NULL,25,1950);
+INSERT INTO tournament_entry VALUES(10,'P0CT',NULL,NULL,139,423);
+INSERT INTO tournament_entry VALUES(10,'PL56',12,NULL,12,3210);
+INSERT INTO tournament_entry VALUES(10,'Q02L',NULL,'Q',106,538);
+INSERT INTO tournament_entry VALUES(10,'R0DG',10,NULL,10,3440);
+INSERT INTO tournament_entry VALUES(10,'R0EB',NULL,'WC',120,478);
+INSERT INTO tournament_entry VALUES(10,'R0GO',NULL,'Q',200,278);
+INSERT INTO tournament_entry VALUES(10,'R772',NULL,'Q',251,224);
+INSERT INTO tournament_entry VALUES(10,'RC91',NULL,NULL,75,801);
+INSERT INTO tournament_entry VALUES(10,'RE44',17,NULL,15,2820);
+INSERT INTO tournament_entry VALUES(10,'RH16',7,NULL,8,3655);
+INSERT INTO tournament_entry VALUES(10,'S0AG',1,NULL,1,10380);
+INSERT INTO tournament_entry VALUES(10,'S0H2',NULL,'LL',103,580);
+INSERT INTO tournament_entry VALUES(10,'S0N0',NULL,'WC',128,464);
+INSERT INTO tournament_entry VALUES(10,'S0S1',13,NULL,13,2980);
+INSERT INTO tournament_entry VALUES(10,'SL28',NULL,NULL,87,690);
+INSERT INTO tournament_entry VALUES(10,'SU55',27,NULL,31,1701);
+INSERT INTO tournament_entry VALUES(10,'SU87',NULL,NULL,44,1205);
+INSERT INTO tournament_entry VALUES(10,'SX50',NULL,NULL,72,816);
+INSERT INTO tournament_entry VALUES(10,'T09X',NULL,'Q',280,196);
+INSERT INTO tournament_entry VALUES(10,'T0A1',NULL,'LL',132,453);
+INSERT INTO tournament_entry VALUES(10,'T0HA',NULL,NULL,67,893);
+INSERT INTO tournament_entry VALUES(10,'TC61',NULL,NULL,40,1375);
+INSERT INTO tournament_entry VALUES(10,'TD51',15,NULL,16,2665);
+INSERT INTO tournament_entry VALUES(10,'TE30',NULL,NULL,61,940);
+INSERT INTO tournament_entry VALUES(10,'TE51',20,NULL,20,2270);
+INSERT INTO tournament_entry VALUES(10,'U182',NULL,NULL,51,1040);
+INSERT INTO tournament_entry VALUES(10,'V812',NULL,NULL,89,670);
+INSERT INTO tournament_entry VALUES(10,'V832',NULL,NULL,80,783);
+INSERT INTO tournament_entry VALUES(10,'W09E',NULL,NULL,91,653);
+INSERT INTO tournament_entry VALUES(10,'W367',NULL,'WC',138,432);
+INSERT INTO tournament_entry VALUES(10,'Y09V',NULL,NULL,70,874);
+INSERT INTO tournament_entry VALUES(10,'Z0A1',NULL,'Q',310,172);
+INSERT INTO tournament_entry VALUES(10,'Z355',3,NULL,3,7285);
+INSERT INTO tournament_entry VALUES(11,'A0E2',2,NULL,2,9300);
+INSERT INTO tournament_entry VALUES(11,'A0FC',NULL,NULL,43,1215);
+INSERT INTO tournament_entry VALUES(11,'AE14',NULL,NULL,57,998);
+INSERT INTO tournament_entry VALUES(11,'AG37',25,NULL,28,1825);
+INSERT INTO tournament_entry VALUES(11,'B0BI',NULL,NULL,38,1370);
+INSERT INTO tournament_entry VALUES(11,'B0CD',NULL,NULL,101,577);
+INSERT INTO tournament_entry VALUES(11,'B0GG',NULL,NULL,73,864);
+INSERT INTO tournament_entry VALUES(11,'B0NN',NULL,NULL,100,595);
+INSERT INTO tournament_entry VALUES(11,'BD06',NULL,NULL,42,1236);
+INSERT INTO tournament_entry VALUES(11,'BG23',NULL,'Q',126,474);
+INSERT INTO tournament_entry VALUES(11,'BI81',NULL,'Q',179,309);
+INSERT INTO tournament_entry VALUES(11,'BK40',32,NULL,35,1515);
+INSERT INTO tournament_entry VALUES(11,'BK92',28,NULL,31,1675);
+INSERT INTO tournament_entry VALUES(11,'BM95',NULL,NULL,64,930);
+INSERT INTO tournament_entry VALUES(11,'BT72',NULL,NULL,37,1400);
+INSERT INTO tournament_entry VALUES(11,'BU13',NULL,NULL,50,1079);
+INSERT INTO tournament_entry VALUES(11,'C0AK',NULL,'WC',248,229);
+INSERT INTO tournament_entry VALUES(11,'C0AU',16,NULL,19,2285);
+INSERT INTO tournament_entry VALUES(11,'C0DF',NULL,NULL,65,914);
+INSERT INTO tournament_entry VALUES(11,'C0E9',22,NULL,24,2035);
+INSERT INTO tournament_entry VALUES(11,'C0H0',NULL,'Q',115,505);
+INSERT INTO tournament_entry VALUES(11,'C0JP',NULL,NULL,85,705);
+INSERT INTO tournament_entry VALUES(11,'C977',NULL,NULL,83,722);
+INSERT INTO tournament_entry VALUES(11,'CF59',NULL,NULL,74,849);
+INSERT INTO tournament_entry VALUES(11,'CI14',NULL,'WC',196,283);
+INSERT INTO tournament_entry VALUES(11,'D0C1',NULL,NULL,106,548);
+INSERT INTO tournament_entry VALUES(11,'D0CO',4,NULL,4,4650);
+INSERT INTO tournament_entry VALUES(11,'D0F6',NULL,NULL,40,1322);
+INSERT INTO tournament_entry VALUES(11,'D0FJ',NULL,NULL,59,989);
+INSERT INTO tournament_entry VALUES(11,'D643',6,NULL,6,4630);
+INSERT INTO tournament_entry VALUES(11,'D875',19,NULL,21,2155);
+INSERT INTO tournament_entry VALUES(11,'D923',NULL,NULL,67,900);
+INSERT INTO tournament_entry VALUES(11,'D994',NULL,NULL,103,566);
+INSERT INTO tournament_entry VALUES(11,'DA31',NULL,NULL,79,751);
+INSERT INTO tournament_entry VALUES(11,'DB63',NULL,NULL,60,961);
+INSERT INTO tournament_entry VALUES(11,'DH50',26,NULL,27,1845);
+INSERT INTO tournament_entry VALUES(11,'DH58',11,NULL,11,3085);
+INSERT INTO tournament_entry VALUES(11,'E687',NULL,'WC',154,375);
+INSERT INTO tournament_entry VALUES(11,'E865',NULL,NULL,130,454);
+INSERT INTO tournament_entry VALUES(11,'EA24',NULL,NULL,53,1025);
+INSERT INTO tournament_entry VALUES(11,'F0BY',NULL,NULL,51,1060);
+INSERT INTO tournament_entry VALUES(11,'F0DM',NULL,'WC',461,91);
+INSERT INTO tournament_entry VALUES(11,'F0F2',NULL,'Q',116,503);
+INSERT INTO tournament_entry VALUES(11,'F0FV',NULL,NULL,54,1016);
+INSERT INTO tournament_entry VALUES(11,'F510',NULL,NULL,138,437);
+INSERT INTO tournament_entry VALUES(11,'F724',NULL,'LL',105,564);
+INSERT INTO tournament_entry VALUES(11,'FB98',5,NULL,5,4635);
+INSERT INTO tournament_entry VALUES(11,'G09O',NULL,NULL,86,693);
+INSERT INTO tournament_entry VALUES(11,'GB88',NULL,NULL,63,930);
+INSERT INTO tournament_entry VALUES(11,'GC88',NULL,NULL,45,1200);
+INSERT INTO tournament_entry VALUES(11,'GD64',NULL,'LL',110,525);
+INSERT INTO tournament_entry VALUES(11,'GJ37',31,NULL,29,1755);
+INSERT INTO tournament_entry VALUES(11,'H09N',NULL,'Q',192,285);
+INSERT INTO tournament_entry VALUES(11,'H09P',NULL,NULL,99,600);
+INSERT INTO tournament_entry VALUES(11,'H0BH',NULL,NULL,87,693);
+INSERT INTO tournament_entry VALUES(11,'HB64',NULL,NULL,46,1174);
+INSERT INTO tournament_entry VALUES(11,'HD68',NULL,NULL,151,383);
+INSERT INTO tournament_entry VALUES(11,'HG86',NULL,NULL,320,159);
+INSERT INTO tournament_entry VALUES(11,'HH26',18,NULL,18,2285);
+INSERT INTO tournament_entry VALUES(11,'J551',NULL,'Q',143,418);
+INSERT INTO tournament_entry VALUES(11,'K0AZ',NULL,NULL,76,799);
+INSERT INTO tournament_entry VALUES(11,'KE29',17,NULL,20,2240);
+INSERT INTO tournament_entry VALUES(11,'KI82',NULL,NULL,78,757);
+INSERT INTO tournament_entry VALUES(11,'KI95',NULL,NULL,49,1106);
+INSERT INTO tournament_entry VALUES(11,'L0BV',23,NULL,25,1965);
+INSERT INTO tournament_entry VALUES(11,'L0CF',NULL,'WC',293,185);
+INSERT INTO tournament_entry VALUES(11,'L987',NULL,'LL',118,498);
+INSERT INTO tournament_entry VALUES(11,'M0CI',NULL,NULL,58,990);
+INSERT INTO tournament_entry VALUES(11,'M0EJ',7,NULL,7,4140);
+INSERT INTO tournament_entry VALUES(11,'M0FH',21,NULL,23,2110);
+INSERT INTO tournament_entry VALUES(11,'M0GZ',NULL,NULL,36,1411);
+INSERT INTO tournament_entry VALUES(11,'M0HU',NULL,'Q',144,413);
+INSERT INTO tournament_entry VALUES(11,'M0JF',NULL,NULL,68,896);
+INSERT INTO tournament_entry VALUES(11,'M0JZ',NULL,'Q',111,518);
+INSERT INTO tournament_entry VALUES(11,'M0K4',NULL,NULL,117,499);
+INSERT INTO tournament_entry VALUES(11,'M0NI',15,NULL,17,2356);
+INSERT INTO tournament_entry VALUES(11,'M0ON',NULL,'WC',224,249);
+INSERT INTO tournament_entry VALUES(11,'M0OQ',NULL,'Q',181,308);
+INSERT INTO tournament_entry VALUES(11,'M0QI',30,NULL,32,1670);
+INSERT INTO tournament_entry VALUES(11,'MC65',NULL,NULL,48,1165);
+INSERT INTO tournament_entry VALUES(11,'ME82',NULL,'Q',123,477);
+INSERT INTO tournament_entry VALUES(11,'MK66',NULL,NULL,88,689);
+INSERT INTO tournament_entry VALUES(11,'MM58',9,NULL,9,3420);
+INSERT INTO tournament_entry VALUES(11,'MO44',NULL,NULL,52,1030);
+INSERT INTO tournament_entry VALUES(11,'MP20',NULL,NULL,41,1311);
+INSERT INTO tournament_entry VALUES(11,'MQ75',NULL,NULL,109,527);
+INSERT INTO tournament_entry VALUES(11,'MU94',NULL,NULL,55,1012);
+INSERT INTO tournament_entry VALUES(11,'MW02',NULL,NULL,69,894);
+INSERT INTO tournament_entry VALUES(11,'N0AE',29,NULL,34,1650);
+INSERT INTO tournament_entry VALUES(11,'N0BG',NULL,NULL,95,655);
+INSERT INTO tournament_entry VALUES(11,'N0BS',NULL,NULL,91,670);
+INSERT INTO tournament_entry VALUES(11,'N732',NULL,NULL,82,724);
+INSERT INTO tournament_entry VALUES(11,'N771',NULL,NULL,61,952);
+INSERT INTO tournament_entry VALUES(11,'O483',NULL,NULL,77,775);
+INSERT INTO tournament_entry VALUES(11,'O513',NULL,NULL,165,343);
+INSERT INTO tournament_entry VALUES(11,'O522',NULL,NULL,70,877);
+INSERT INTO tournament_entry VALUES(11,'P09Z',20,NULL,22,2140);
+INSERT INTO tournament_entry VALUES(11,'P0HT',NULL,'WC',281,196);
+INSERT INTO tournament_entry VALUES(11,'PL56',13,NULL,13,2970);
+INSERT INTO tournament_entry VALUES(11,'Q02L',NULL,NULL,89,682);
+INSERT INTO tournament_entry VALUES(11,'R0DG',8,NULL,8,3530);
+INSERT INTO tournament_entry VALUES(11,'R0E0',NULL,'Q',163,346);
+INSERT INTO tournament_entry VALUES(11,'R0EB',NULL,'Q',113,513);
+INSERT INTO tournament_entry VALUES(11,'R0FS',NULL,'Q',503,77);
+INSERT INTO tournament_entry VALUES(11,'RC91',NULL,NULL,72,873);
+INSERT INTO tournament_entry VALUES(11,'RE44',14,NULL,14,2920);
+INSERT INTO tournament_entry VALUES(11,'S0AG',1,NULL,1,10430);
+INSERT INTO tournament_entry VALUES(11,'S0H2',NULL,NULL,98,610);
+INSERT INTO tournament_entry VALUES(11,'S0S1',10,NULL,10,3130);
+INSERT INTO tournament_entry VALUES(11,'S0TX',NULL,'WC',421,106);
+INSERT INTO tournament_entry VALUES(11,'SL28',NULL,NULL,125,475);
+INSERT INTO tournament_entry VALUES(11,'SU55',27,NULL,30,1676);
+INSERT INTO tournament_entry VALUES(11,'SU87',NULL,NULL,47,1171);
+INSERT INTO tournament_entry VALUES(11,'SX50',NULL,NULL,75,831);
+INSERT INTO tournament_entry VALUES(11,'T0AP',NULL,NULL,96,643);
+INSERT INTO tournament_entry VALUES(11,'T0GR',NULL,'Q',733,36);
+INSERT INTO tournament_entry VALUES(11,'T0HA',NULL,NULL,62,940);
+INSERT INTO tournament_entry VALUES(11,'TC61',NULL,NULL,44,1200);
+INSERT INTO tournament_entry VALUES(11,'TD51',12,NULL,12,2990);
+INSERT INTO tournament_entry VALUES(11,'TE51',24,NULL,26,1920);
+INSERT INTO tournament_entry VALUES(11,'U182',NULL,NULL,56,1006);
+INSERT INTO tournament_entry VALUES(11,'V812',NULL,NULL,92,670);
+INSERT INTO tournament_entry VALUES(11,'V832',NULL,NULL,93,664);
+INSERT INTO tournament_entry VALUES(11,'W09E',NULL,NULL,90,678);
+INSERT INTO tournament_entry VALUES(11,'Y09V',NULL,NULL,71,874);
+INSERT INTO tournament_entry VALUES(11,'Z09Z',NULL,'Q',247,229);
+INSERT INTO tournament_entry VALUES(11,'Z0A1',NULL,'Q',351,140);
+INSERT INTO tournament_entry VALUES(11,'Z355',3,NULL,3,6500);
+INSERT INTO tournament_entry VALUES(12,'A0E2',2,NULL,2,9590);
+INSERT INTO tournament_entry VALUES(12,'A0FC',NULL,NULL,64,915);
+INSERT INTO tournament_entry VALUES(12,'AE14',NULL,NULL,56,952);
+INSERT INTO tournament_entry VALUES(12,'AG37',25,NULL,27,1965);
+INSERT INTO tournament_entry VALUES(12,'B0BI',NULL,NULL,39,1175);
+INSERT INTO tournament_entry VALUES(12,'B0CD',NULL,NULL,92,687);
+INSERT INTO tournament_entry VALUES(12,'B0EJ',NULL,NULL,113,546);
+INSERT INTO tournament_entry VALUES(12,'B0GG',NULL,NULL,65,914);
+INSERT INTO tournament_entry VALUES(12,'B0ID',NULL,NULL,135,473);
+INSERT INTO tournament_entry VALUES(12,'B0NN',NULL,NULL,104,604);
+INSERT INTO tournament_entry VALUES(12,'B0NO',NULL,NULL,364,136);
+INSERT INTO tournament_entry VALUES(12,'BD06',NULL,NULL,47,1075);
+INSERT INTO tournament_entry VALUES(12,'BK92',23,NULL,24,2055);
+INSERT INTO tournament_entry VALUES(12,'BM95',NULL,NULL,51,999);
+INSERT INTO tournament_entry VALUES(12,'BT72',NULL,NULL,41,1145);
+INSERT INTO tournament_entry VALUES(12,'BU13',NULL,NULL,48,1039);
+INSERT INTO tournament_entry VALUES(12,'BV16',NULL,NULL,184,295);
+INSERT INTO tournament_entry VALUES(12,'C0AU',19,NULL,19,2135);
+INSERT INTO tournament_entry VALUES(12,'C0DF',NULL,NULL,54,962);
+INSERT INTO tournament_entry VALUES(12,'C0E9',24,NULL,26,2040);
+INSERT INTO tournament_entry VALUES(12,'C0JP',NULL,NULL,107,583);
+INSERT INTO tournament_entry VALUES(12,'C977',NULL,NULL,62,922);
+INSERT INTO tournament_entry VALUES(12,'CD85',NULL,NULL,137,468);
+INSERT INTO tournament_entry VALUES(12,'CF59',NULL,NULL,87,740);
+INSERT INTO tournament_entry VALUES(12,'CG80',NULL,NULL,105,595);
+INSERT INTO tournament_entry VALUES(12,'D0C1',NULL,NULL,83,774);
+INSERT INTO tournament_entry VALUES(12,'D0CO',5,NULL,5,4440);
+INSERT INTO tournament_entry VALUES(12,'D0D4',NULL,NULL,389,127);
+INSERT INTO tournament_entry VALUES(12,'D0DT',NULL,NULL,431,106);
+INSERT INTO tournament_entry VALUES(12,'D0F6',31,NULL,33,1388);
+INSERT INTO tournament_entry VALUES(12,'D0FJ',32,NULL,34,1379);
+INSERT INTO tournament_entry VALUES(12,'D643',7,NULL,7,4130);
+INSERT INTO tournament_entry VALUES(12,'D923',NULL,NULL,61,933);
+INSERT INTO tournament_entry VALUES(12,'D994',NULL,NULL,106,584);
+INSERT INTO tournament_entry VALUES(12,'DA31',NULL,NULL,121,524);
+INSERT INTO tournament_entry VALUES(12,'DH50',18,NULL,18,2185);
+INSERT INTO tournament_entry VALUES(12,'DH58',8,NULL,8,3545);
+INSERT INTO tournament_entry VALUES(12,'EA24',NULL,NULL,59,940);
+INSERT INTO tournament_entry VALUES(12,'F0BY',NULL,NULL,60,939);
+INSERT INTO tournament_entry VALUES(12,'F0F2',NULL,NULL,117,530);
+INSERT INTO tournament_entry VALUES(12,'F0FV',NULL,NULL,45,1095);
+INSERT INTO tournament_entry VALUES(12,'F724',NULL,NULL,63,916);
+INSERT INTO tournament_entry VALUES(12,'FB98',4,NULL,4,5575);
+INSERT INTO tournament_entry VALUES(12,'G09O',NULL,NULL,125,513);
+INSERT INTO tournament_entry VALUES(12,'GB88',NULL,NULL,80,784);
+INSERT INTO tournament_entry VALUES(12,'GC88',NULL,NULL,55,960);
+INSERT INTO tournament_entry VALUES(12,'GE33',NULL,NULL,131,480);
+INSERT INTO tournament_entry VALUES(12,'GJ16',NULL,NULL,203,268);
+INSERT INTO tournament_entry VALUES(12,'GJ37',29,NULL,30,1655);
+INSERT INTO tournament_entry VALUES(12,'H09P',NULL,NULL,110,554);
+INSERT INTO tournament_entry VALUES(12,'H0BH',NULL,NULL,103,623);
+INSERT INTO tournament_entry VALUES(12,'HB64',NULL,NULL,70,873);
+INSERT INTO tournament_entry VALUES(12,'HD68',NULL,NULL,151,382);
+INSERT INTO tournament_entry VALUES(12,'HG86',NULL,NULL,353,139);
+INSERT INTO tournament_entry VALUES(12,'HH26',22,NULL,23,2085);
+INSERT INTO tournament_entry VALUES(12,'J551',NULL,NULL,102,628);
+INSERT INTO tournament_entry VALUES(12,'K0AH',NULL,NULL,75,835);
+INSERT INTO tournament_entry VALUES(12,'K0AZ',NULL,NULL,71,862);
+INSERT INTO tournament_entry VALUES(12,'K0EP',NULL,NULL,175,309);
+INSERT INTO tournament_entry VALUES(12,'KE29',9,NULL,9,3240);
+INSERT INTO tournament_entry VALUES(12,'KI82',NULL,NULL,89,732);
+INSERT INTO tournament_entry VALUES(12,'KI95',NULL,NULL,42,1126);
+INSERT INTO tournament_entry VALUES(12,'L0BV',20,NULL,21,2115);
+INSERT INTO tournament_entry VALUES(12,'L0CX',NULL,NULL,361,136);
+INSERT INTO tournament_entry VALUES(12,'M0CI',NULL,NULL,53,975);
+INSERT INTO tournament_entry VALUES(12,'M0EJ',10,NULL,10,3205);
+INSERT INTO tournament_entry VALUES(12,'M0FH',21,NULL,22,2110);
+INSERT INTO tournament_entry VALUES(12,'M0GZ',NULL,NULL,37,1275);
+INSERT INTO tournament_entry VALUES(12,'M0HU',NULL,NULL,112,550);
+INSERT INTO tournament_entry VALUES(12,'M0JF',NULL,NULL,57,950);
+INSERT INTO tournament_entry VALUES(12,'M0K4',NULL,NULL,109,560);
+INSERT INTO tournament_entry VALUES(12,'M0NI',16,NULL,16,2430);
+INSERT INTO tournament_entry VALUES(12,'M0QI',28,NULL,32,1525);
+INSERT INTO tournament_entry VALUES(12,'MC65',NULL,NULL,49,1015);
+INSERT INTO tournament_entry VALUES(12,'ME82',NULL,NULL,77,811);
+INSERT INTO tournament_entry VALUES(12,'MK66',NULL,NULL,100,642);
+INSERT INTO tournament_entry VALUES(12,'MM58',13,NULL,13,2760);
+INSERT INTO tournament_entry VALUES(12,'MO44',NULL,NULL,66,913);
+INSERT INTO tournament_entry VALUES(12,'MP20',NULL,NULL,38,1208);
+INSERT INTO tournament_entry VALUES(12,'MQ75',NULL,NULL,76,819);
+INSERT INTO tournament_entry VALUES(12,'MU94',NULL,NULL,44,1117);
+INSERT INTO tournament_entry VALUES(12,'MW02',NULL,NULL,40,1146);
+INSERT INTO tournament_entry VALUES(12,'N0AE',30,NULL,31,1570);
+INSERT INTO tournament_entry VALUES(12,'N0AM',NULL,NULL,101,640);
+INSERT INTO tournament_entry VALUES(12,'N0BG',NULL,NULL,86,755);
+INSERT INTO tournament_entry VALUES(12,'N0BS',NULL,NULL,78,810);
+INSERT INTO tournament_entry VALUES(12,'N732',NULL,NULL,149,399);
+INSERT INTO tournament_entry VALUES(12,'N771',NULL,NULL,35,1297);
+INSERT INTO tournament_entry VALUES(12,'O483',NULL,NULL,81,784);
+INSERT INTO tournament_entry VALUES(12,'O513',NULL,NULL,140,453);
+INSERT INTO tournament_entry VALUES(12,'O522',NULL,NULL,67,895);
+INSERT INTO tournament_entry VALUES(12,'P09O',NULL,NULL,156,362);
+INSERT INTO tournament_entry VALUES(12,'P09Z',NULL,NULL,36,1290);
+INSERT INTO tournament_entry VALUES(12,'P0CT',NULL,NULL,120,524);
+INSERT INTO tournament_entry VALUES(12,'P0HW',NULL,NULL,124,514);
+INSERT INTO tournament_entry VALUES(12,'PL56',14,NULL,14,2610);
+INSERT INTO tournament_entry VALUES(12,'Q02L',NULL,NULL,84,771);
+INSERT INTO tournament_entry VALUES(12,'R0DG',11,NULL,11,3050);
+INSERT INTO tournament_entry VALUES(12,'R0EB',NULL,NULL,98,643);
+INSERT INTO tournament_entry VALUES(12,'R0FS',NULL,NULL,435,104);
+INSERT INTO tournament_entry VALUES(12,'RC91',NULL,NULL,82,782);
+INSERT INTO tournament_entry VALUES(12,'RE44',15,NULL,15,2610);
+INSERT INTO tournament_entry VALUES(12,'RH16',12,NULL,12,2905);
+INSERT INTO tournament_entry VALUES(12,'RH24',NULL,NULL,752,36);
+INSERT INTO tournament_entry VALUES(12,'S0AG',1,NULL,1,11480);
+INSERT INTO tournament_entry VALUES(12,'S0H2',NULL,NULL,91,692);
+INSERT INTO tournament_entry VALUES(12,'S0JA',NULL,NULL,127,493);
+INSERT INTO tournament_entry VALUES(12,'S0K7',NULL,NULL,145,421);
+INSERT INTO tournament_entry VALUES(12,'S0N0',NULL,NULL,96,654);
+INSERT INTO tournament_entry VALUES(12,'S0RE',NULL,NULL,111,550);
+INSERT INTO tournament_entry VALUES(12,'S0S1',6,NULL,6,4280);
+INSERT INTO tournament_entry VALUES(12,'SL28',NULL,NULL,144,428);
+INSERT INTO tournament_entry VALUES(12,'SU55',27,NULL,29,1748);
+INSERT INTO tournament_entry VALUES(12,'SU87',NULL,NULL,46,1090);
+INSERT INTO tournament_entry VALUES(12,'SX50',NULL,NULL,94,676);
+INSERT INTO tournament_entry VALUES(12,'T0AP',NULL,NULL,118,529);
+INSERT INTO tournament_entry VALUES(12,'T0HA',NULL,NULL,50,1000);
+INSERT INTO tournament_entry VALUES(12,'TC61',NULL,NULL,58,945);
+INSERT INTO tournament_entry VALUES(12,'TD51',17,NULL,17,2340);
+INSERT INTO tournament_entry VALUES(12,'TE30',NULL,NULL,122,517);
+INSERT INTO tournament_entry VALUES(12,'TE51',26,NULL,28,1790);
+INSERT INTO tournament_entry VALUES(12,'U182',NULL,NULL,43,1123);
+INSERT INTO tournament_entry VALUES(12,'V812',NULL,NULL,73,849);
+INSERT INTO tournament_entry VALUES(12,'V832',NULL,NULL,95,668);
+INSERT INTO tournament_entry VALUES(12,'W09E',NULL,NULL,85,763);
+INSERT INTO tournament_entry VALUES(12,'W0BH',NULL,NULL,173,315);
+INSERT INTO tournament_entry VALUES(12,'Y09V',NULL,NULL,74,841);
+INSERT INTO tournament_entry VALUES(12,'Z355',3,NULL,3,6230);
+INSERT INTO tournament_entry VALUES(13,'A0E2',3,NULL,3,7010);
+INSERT INTO tournament_entry VALUES(13,'A0FC',NULL,NULL,39,1305);
+INSERT INTO tournament_entry VALUES(13,'AE14',NULL,NULL,101,582);
+INSERT INTO tournament_entry VALUES(13,'AG37',29,NULL,23,1905);
+INSERT INTO tournament_entry VALUES(13,'B0BI',28,NULL,28,1690);
+INSERT INTO tournament_entry VALUES(13,'B0CD',NULL,NULL,NULL,NULL);
+INSERT INTO tournament_entry VALUES(13,'B0EJ',NULL,'Q',136,448);
+INSERT INTO tournament_entry VALUES(13,'B0NN',NULL,'WC',107,566);
+INSERT INTO tournament_entry VALUES(13,'BD06',NULL,NULL,53,1067);
+INSERT INTO tournament_entry VALUES(13,'BG23',NULL,'Q',206,273);
+INSERT INTO tournament_entry VALUES(13,'BK40',NULL,NULL,34,1380);
+INSERT INTO tournament_entry VALUES(13,'BK92',NULL,NULL,37,1330);
+INSERT INTO tournament_entry VALUES(13,'BM95',NULL,NULL,64,819);
+INSERT INTO tournament_entry VALUES(13,'BT72',NULL,NULL,33,1445);
+INSERT INTO tournament_entry VALUES(13,'BU13',NULL,NULL,60,948);
+INSERT INTO tournament_entry VALUES(13,'C0AU',31,NULL,31,1620);
+INSERT INTO tournament_entry VALUES(13,'C0DF',NULL,NULL,85,662);
+INSERT INTO tournament_entry VALUES(13,'C0E9',32,NULL,32,1512);
+INSERT INTO tournament_entry VALUES(13,'C0H0',NULL,NULL,78,732);
+INSERT INTO tournament_entry VALUES(13,'CD85',NULL,NULL,182,317);
+INSERT INTO tournament_entry VALUES(13,'CE77',NULL,NULL,96,617);
+INSERT INTO tournament_entry VALUES(13,'CF59',NULL,NULL,57,981);
+INSERT INTO tournament_entry VALUES(13,'CG80',NULL,NULL,87,639);
+INSERT INTO tournament_entry VALUES(13,'D0CG',NULL,NULL,73,758);
+INSERT INTO tournament_entry VALUES(13,'D0CO',15,NULL,18,2530);
+INSERT INTO tournament_entry VALUES(13,'D0F6',NULL,NULL,86,646);
+INSERT INTO tournament_entry VALUES(13,'D0FJ',NULL,NULL,45,1198);
+INSERT INTO tournament_entry VALUES(13,'D643',7,NULL,7,3900);
+INSERT INTO tournament_entry VALUES(13,'D875',10,NULL,10,3200);
+INSERT INTO tournament_entry VALUES(13,'D923',NULL,NULL,82,679);
+INSERT INTO tournament_entry VALUES(13,'D994',NULL,NULL,89,637);
+INSERT INTO tournament_entry VALUES(13,'DA81',NULL,NULL,113,519);
+INSERT INTO tournament_entry VALUES(13,'DF88',NULL,'Q',231,254);
+INSERT INTO tournament_entry VALUES(13,'DH50',NULL,NULL,66,790);
+INSERT INTO tournament_entry VALUES(13,'DH58',8,NULL,8,3535);
+INSERT INTO tournament_entry VALUES(13,'EA24',NULL,NULL,38,1315);
+INSERT INTO tournament_entry VALUES(13,'F0BY',NULL,NULL,92,632);
+INSERT INTO tournament_entry VALUES(13,'F0F1',20,NULL,21,2280);
+INSERT INTO tournament_entry VALUES(13,'F0F2',NULL,'Q',125,481);
+INSERT INTO tournament_entry VALUES(13,'F0FV',NULL,'Q',112,520);
+INSERT INTO tournament_entry VALUES(13,'FB98',4,NULL,4,5350);
+INSERT INTO tournament_entry VALUES(13,'G09O',NULL,NULL,81,703);
+INSERT INTO tournament_entry VALUES(13,'G0GD',NULL,'Q',145,403);
+INSERT INTO tournament_entry VALUES(13,'GB88',NULL,NULL,54,1029);
+INSERT INTO tournament_entry VALUES(13,'GC88',NULL,NULL,46,1175);
+INSERT INTO tournament_entry VALUES(13,'GD64',NULL,'Q',150,382);
+INSERT INTO tournament_entry VALUES(13,'GJ37',NULL,NULL,40,1280);
+INSERT INTO tournament_entry VALUES(13,'H0BH',NULL,NULL,72,759);
+INSERT INTO tournament_entry VALUES(13,'H997',NULL,NULL,95,618);
+INSERT INTO tournament_entry VALUES(13,'HB64',NULL,NULL,74,756);
+INSERT INTO tournament_entry VALUES(13,'HB71',18,NULL,17,2555);
+INSERT INTO tournament_entry VALUES(13,'HF80',NULL,'Q',219,264);
+INSERT INTO tournament_entry VALUES(13,'HH26',14,NULL,14,2765);
+INSERT INTO tournament_entry VALUES(13,'J551',NULL,NULL,36,1340);
+INSERT INTO tournament_entry VALUES(13,'J553',NULL,'WC',179,323);
+INSERT INTO tournament_entry VALUES(13,'K09F',NULL,NULL,97,612);
+INSERT INTO tournament_entry VALUES(13,'K0AH',22,NULL,22,2065);
+INSERT INTO tournament_entry VALUES(13,'KC12',NULL,'Q',146,396);
+INSERT INTO tournament_entry VALUES(13,'KD46',NULL,NULL,71,766);
+INSERT INTO tournament_entry VALUES(13,'KE17',NULL,NULL,NULL,NULL);
+INSERT INTO tournament_entry VALUES(13,'KE29',19,NULL,19,2410);
+INSERT INTO tournament_entry VALUES(13,'KE73',NULL,'Q',124,485);
+INSERT INTO tournament_entry VALUES(13,'KI63',NULL,'Q',144,405);
+INSERT INTO tournament_entry VALUES(13,'KI95',NULL,NULL,51,1096);
+INSERT INTO tournament_entry VALUES(13,'L0BV',24,NULL,29,1660);
+INSERT INTO tournament_entry VALUES(13,'L0IL',NULL,'Q',142,414);
+INSERT INTO tournament_entry VALUES(13,'L987',NULL,NULL,80,717);
+INSERT INTO tournament_entry VALUES(13,'M0CI',NULL,NULL,59,960);
+INSERT INTO tournament_entry VALUES(13,'M0EJ',16,NULL,15,2600);
+INSERT INTO tournament_entry VALUES(13,'M0FH',26,NULL,25,1805);
+INSERT INTO tournament_entry VALUES(13,'M0GZ',30,NULL,30,1651);
+INSERT INTO tournament_entry VALUES(13,'M0NI',NULL,NULL,48,1162);
+INSERT INTO tournament_entry VALUES(13,'M0OQ',NULL,'WC',258,216);
+INSERT INTO tournament_entry VALUES(13,'M0QI',NULL,NULL,42,1270);
+INSERT INTO tournament_entry VALUES(13,'MC65',NULL,NULL,41,1280);
+INSERT INTO tournament_entry VALUES(13,'ME82',NULL,NULL,75,751);
+INSERT INTO tournament_entry VALUES(13,'MJ08',NULL,'Q',105,566);
+INSERT INTO tournament_entry VALUES(13,'MM58',5,NULL,5,5030);
+INSERT INTO tournament_entry VALUES(13,'MO44',NULL,NULL,44,1220);
+INSERT INTO tournament_entry VALUES(13,'MP20',NULL,NULL,58,965);
+INSERT INTO tournament_entry VALUES(13,'MQ75',NULL,'Q',122,491);
+INSERT INTO tournament_entry VALUES(13,'MU94',NULL,NULL,62,922);
+INSERT INTO tournament_entry VALUES(13,'MW02',NULL,NULL,69,772);
+INSERT INTO tournament_entry VALUES(13,'N0AE',NULL,NULL,35,1355);
+INSERT INTO tournament_entry VALUES(13,'N0BG',NULL,NULL,83,675);
+INSERT INTO tournament_entry VALUES(13,'N0BS',NULL,NULL,47,1173);
+INSERT INTO tournament_entry VALUES(13,'N552',NULL,NULL,76,743);
+INSERT INTO tournament_entry VALUES(13,'N732',NULL,NULL,65,807);
+INSERT INTO tournament_entry VALUES(13,'N771',NULL,NULL,52,1082);
+INSERT INTO tournament_entry VALUES(13,'N897',NULL,NULL,91,635);
+INSERT INTO tournament_entry VALUES(13,'O0A2',NULL,'Q',239,242);
+INSERT INTO tournament_entry VALUES(13,'O483',NULL,NULL,70,770);
+INSERT INTO tournament_entry VALUES(13,'O522',NULL,NULL,170,341);
+INSERT INTO tournament_entry VALUES(13,'P09Z',25,NULL,24,1840);
+INSERT INTO tournament_entry VALUES(13,'P0CT',NULL,'LL',104,571);
+INSERT INTO tournament_entry VALUES(13,'PF39',NULL,'WC',103,575);
+INSERT INTO tournament_entry VALUES(13,'PL56',12,NULL,11,3195);
+INSERT INTO tournament_entry VALUES(13,'R0DG',13,NULL,13,2910);
+INSERT INTO tournament_entry VALUES(13,'RC91',NULL,NULL,61,927);
+INSERT INTO tournament_entry VALUES(13,'RE44',9,NULL,9,3520);
+INSERT INTO tournament_entry VALUES(13,'RH16',6,NULL,6,4210);
+INSERT INTO tournament_entry VALUES(13,'S0AG',1,NULL,1,11830);
+INSERT INTO tournament_entry VALUES(13,'S0H2',NULL,NULL,77,743);
+INSERT INTO tournament_entry VALUES(13,'S0HR',NULL,'WC',418,109);
+INSERT INTO tournament_entry VALUES(13,'S0LA',NULL,NULL,304,173);
+INSERT INTO tournament_entry VALUES(13,'S0N0',NULL,'WC',173,336);
+INSERT INTO tournament_entry VALUES(13,'S0RE',NULL,NULL,50,1115);
+INSERT INTO tournament_entry VALUES(13,'S0S1',21,NULL,20,2280);
+INSERT INTO tournament_entry VALUES(13,'SL28',NULL,NULL,43,1240);
+INSERT INTO tournament_entry VALUES(13,'SU55',NULL,NULL,56,1006);
+INSERT INTO tournament_entry VALUES(13,'SU87',NULL,NULL,55,1026);
+INSERT INTO tournament_entry VALUES(13,'SX50',NULL,NULL,63,823);
+INSERT INTO tournament_entry VALUES(13,'SX91',NULL,NULL,79,732);
+INSERT INTO tournament_entry VALUES(13,'T0HA',NULL,'Q',121,493);
+INSERT INTO tournament_entry VALUES(13,'TC01',NULL,'WC',168,342);
+INSERT INTO tournament_entry VALUES(13,'TC61',27,NULL,27,1695);
+INSERT INTO tournament_entry VALUES(13,'TD51',17,NULL,16,2560);
+INSERT INTO tournament_entry VALUES(13,'TE30',23,NULL,26,1705);
+INSERT INTO tournament_entry VALUES(13,'TE51',11,NULL,12,3195);
+INSERT INTO tournament_entry VALUES(13,'U182',NULL,NULL,94,624);
+INSERT INTO tournament_entry VALUES(13,'V0AM',NULL,NULL,93,627);
+INSERT INTO tournament_entry VALUES(13,'V812',NULL,NULL,84,672);
+INSERT INTO tournament_entry VALUES(13,'V832',NULL,NULL,68,778);
+INSERT INTO tournament_entry VALUES(13,'W09E',NULL,NULL,90,636);
+INSERT INTO tournament_entry VALUES(13,'W367',NULL,'WC',156,371);
+INSERT INTO tournament_entry VALUES(13,'Y09V',NULL,NULL,67,784);
+INSERT INTO tournament_entry VALUES(13,'Z355',2,NULL,2,7635);
+INSERT INTO tournament_entry VALUES(13,'Z371',NULL,NULL,49,1140);
+
+-- load match rows
+INSERT INTO "match" VALUES(1,1,'2025-04-21',1,'O','A0FC','CG80','4-6 6-4 7-5','R128',167,13,4,97,49,36,27,16,6,8,5,3,106,74,54,12,16,3,6);
+INSERT INTO "match" VALUES(2,1,'2025-04-21',2,'O','D0FJ','HB64','6-4 6-4','R128',73,5,0,48,29,23,15,10,2,3,6,3,59,28,20,17,10,4,7);
+INSERT INTO "match" VALUES(3,1,'2025-04-21',3,'O','D0F6','BU13','6-1 6-2','R128',57,4,0,37,21,18,14,8,0,0,3,0,38,25,14,5,7,0,4);
+INSERT INTO "match" VALUES(4,1,'2025-04-21',4,'O','D923','B0GG','4-6 6-4 6-2','R128',154,0,2,92,67,42,16,14,9,11,4,2,95,59,37,17,14,7,11);
+INSERT INTO "match" VALUES(5,1,'2025-04-21',5,'O','EA24','M0JF','6-4 6-7(4) 6-4','R128',196,10,1,135,92,63,20,16,20,22,8,0,109,62,39,28,16,8,12);
+INSERT INTO "match" VALUES(6,1,'2025-04-21',6,'O','F0BY','Y09V','6-3 7-6(2)','R128',105,6,3,60,35,29,15,10,2,3,4,1,75,46,30,13,11,4,7);
+INSERT INTO "match" VALUES(7,1,'2025-04-21',7,'O','F0FV','M0K4','6-2 6-3','R128',73,5,1,53,37,27,8,8,0,0,0,2,63,41,23,10,9,9,13);
+INSERT INTO "match" VALUES(8,1,'2025-04-21',8,'O','GC88','T0HA','6-1 1-6 7-6(4)','R128',127,6,4,104,61,43,20,13,5,8,5,3,96,47,33,27,13,4,7);
+INSERT INTO "match" VALUES(9,1,'2025-04-21',9,'O','GJ37','KI82','6-1 6-4','R128',72,5,3,48,35,32,5,9,0,0,3,2,56,31,20,11,8,6,9);
+INSERT INTO "match" VALUES(10,1,'2025-04-21',10,'O','J551','AE14','6-3 6-2','R128',76,4,0,47,22,21,15,9,0,0,5,0,52,37,23,6,8,4,7);
+INSERT INTO "match" VALUES(11,1,'2025-04-21',11,'O','MP20','GB88','6-3 3-6 1-0 RET','R128',99,2,3,73,49,28,11,10,2,6,1,3,50,26,17,9,9,3,7);
+INSERT INTO "match" VALUES(12,1,'2025-04-21',12,'O','N552','V832','6-4 3-6 6-3','R128',119,4,3,81,50,37,18,14,2,4,10,2,101,66,46,16,14,8,11);
+INSERT INTO "match" VALUES(13,1,'2025-04-21',13,'O','N771','L0IL','6-7(4) 7-5 6-4','R128',161,7,4,114,79,52,19,17,7,10,12,15,109,73,50,14,17,5,10);
+INSERT INTO "match" VALUES(14,1,'2025-04-21',14,'O','O522','H0BH','7-5 7-5','R128',125,8,2,80,49,39,17,12,1,1,2,2,88,53,35,18,12,9,11);
+INSERT INTO "match" VALUES(15,1,'2025-04-21',15,'O','SU87','KI95','6-4 7-6(5)','R128',123,1,4,88,58,43,15,11,6,6,1,1,78,49,35,16,11,8,9);
+INSERT INTO "match" VALUES(16,1,'2025-04-21',16,'O','SL28','V812','7-5 2-6 4-1 RET','R128',102,5,0,66,37,26,17,12,3,6,9,5,77,42,33,12,13,4,8);
+INSERT INTO "match" VALUES(17,1,'2025-04-21',17,'O','BD06','MU94','6-4 2-6 6-3','R128',137,2,0,85,55,35,13,14,7,12,6,1,73,48,33,8,13,1,6);
+INSERT INTO "match" VALUES(18,1,'2025-04-21',18,'O','BM95','C977','6-3 6-2','R128',93,6,1,66,45,30,16,9,5,5,3,3,55,23,16,15,8,2,5);
+INSERT INTO "match" VALUES(19,1,'2025-04-21',19,'O','BT72','CD85','6-7(7) 7-6(3) 6-3','R128',152,10,2,106,63,50,28,17,2,2,3,2,99,56,43,28,16,3,4);
+INSERT INTO "match" VALUES(20,1,'2025-04-21',20,'O','BK92','M0QI','7-6(2) 7-6(4)','R128',105,11,3,93,61,44,19,12,8,9,1,0,86,61,46,10,12,7,8);
+INSERT INTO "match" VALUES(21,1,'2025-04-21',21,'O','C0C8','K0AZ','3-6 7-5 6-2','R128',146,9,6,105,68,50,18,14,9,10,3,4,88,48,36,21,15,5,8);
+INSERT INTO "match" VALUES(22,1,'2025-04-21',22,'O','C0NB','W0BH','7-6(5) 6-1','R128',78,1,0,63,42,32,15,10,2,2,2,0,58,41,28,10,9,2,4);
+INSERT INTO "match" VALUES(23,1,'2025-04-21',23,'O','C0E9','M0CI','7-6(4) 7-5','R128',115,3,3,84,47,31,20,12,5,7,3,6,95,56,39,14,12,7,10);
+INSERT INTO "match" VALUES(24,1,'2025-04-21',24,'O','C0DF','MO44','6-4 6-4','R128',108,16,3,66,47,39,6,10,6,7,0,2,84,60,38,10,10,6,9);
+INSERT INTO "match" VALUES(25,1,'2025-04-21',25,'O','DB63','F510','6-2 6-3','R128',67,7,1,46,34,28,9,9,3,4,0,7,58,27,16,13,8,4,8);
+INSERT INTO "match" VALUES(26,1,'2025-04-21',26,'O','M0G4','MW02','6-3 4-2 RET','R128',73,0,1,50,36,26,7,8,0,1,0,1,43,27,16,7,7,3,6);
+INSERT INTO "match" VALUES(27,1,'2025-04-21',27,'O','MC65','GH92','1-6 6-2 6-4','R128',102,6,4,83,54,35,15,13,7,10,4,1,72,46,32,13,12,5,8);
+INSERT INTO "match" VALUES(28,1,'2025-04-21',28,'O','N0BS','M0GZ','6-4 6-4','R128',84,2,1,53,37,30,12,10,1,1,4,1,69,46,34,8,10,4,6);
+INSERT INTO "match" VALUES(29,1,'2025-04-21',29,'O','O483','U182','6-3 6-4','R128',73,5,2,60,38,30,12,10,7,8,2,1,48,34,23,5,9,0,3);
+INSERT INTO "match" VALUES(30,1,'2025-04-21',30,'O','O513','G09O','6-4 6-3','R128',78,6,1,70,35,28,20,10,5,5,2,3,57,29,21,14,9,6,8);
+INSERT INTO "match" VALUES(31,1,'2025-04-21',31,'O','Q02L','L987','6-3 6-4','R128',86,2,0,64,43,30,10,10,4,6,2,2,66,42,26,9,9,5,9);
+INSERT INTO "match" VALUES(32,1,'2025-04-21',32,'O','RC91','SX50','7-6(4) 6-1','R128',81,7,0,57,42,37,6,10,0,1,2,2,65,40,28,11,9,4,7);
+INSERT INTO "match" VALUES(33,1,'2025-04-21',33,'O','A0FC','D643','6-3 6-4','R64',101,5,0,74,41,29,17,10,4,5,4,3,53,33,24,8,9,0,3);
+INSERT INTO "match" VALUES(34,1,'2025-04-21',34,'O','D0CO','GJ37','6-3 6-4','R64',75,5,2,53,27,23,18,10,1,1,3,2,50,38,27,6,9,2,4);
+INSERT INTO "match" VALUES(35,1,'2025-04-21',35,'O','DH58','SU87','6-2 6-3','R64',75,1,0,40,28,23,11,9,1,2,1,5,52,30,19,8,8,2,6);
+INSERT INTO "match" VALUES(36,1,'2025-04-21',36,'O','M0EJ','EA24','7-6(3) 6-2','R64',107,1,1,58,41,29,12,10,0,1,5,2,69,48,32,8,10,10,13);
+INSERT INTO "match" VALUES(37,1,'2025-04-21',37,'O','PL56','F0FV','7-6(7) 7-6(3)','R64',125,9,1,102,69,51,16,12,10,11,2,2,89,64,47,12,12,0,1);
+INSERT INTO "match" VALUES(38,1,'2025-04-21',38,'O','D875','J551','6-3 6-4','R64',97,4,4,64,31,23,22,10,5,5,5,3,68,43,32,9,9,3,5);
+INSERT INTO "match" VALUES(39,1,'2025-04-21',39,'O','TD51','D0FJ','7-5 3-1 RET','R64',67,4,1,38,28,25,7,8,0,0,4,3,61,37,24,12,8,3,5);
+INSERT INTO "match" VALUES(40,1,'2025-04-21',40,'O','TE51','SL28','3-6 6-4 6-3','R64',118,6,3,96,60,45,14,14,4,7,7,1,89,52,39,15,14,4,8);
+INSERT INTO "match" VALUES(41,1,'2025-04-21',41,'O','F0BY','M0FH','1-6 6-3 6-2','R64',104,9,3,78,46,36,14,12,3,5,5,9,86,45,31,21,12,4,7);
+INSERT INTO "match" VALUES(42,1,'2025-04-21',42,'O','MP20','HH26','6-2 6-7(3) 7-6(5)','R64',150,5,2,110,83,55,17,16,5,7,5,3,107,65,44,23,16,3,7);
+INSERT INTO "match" VALUES(43,1,'2025-04-21',43,'O','KE29','O522','7-6(3) 7-6(4)','R64',106,6,1,66,44,40,15,12,0,0,17,3,89,62,47,10,12,4,4);
+INSERT INTO "match" VALUES(44,1,'2025-04-21',44,'O','N771','L0BV','2-6 6-4 6-0','R64',95,4,1,73,47,35,13,12,2,4,9,3,66,39,25,14,12,3,7);
+INSERT INTO "match" VALUES(45,1,'2025-04-21',45,'O','SU55','N552','6-1 6-4','R64',64,4,1,50,30,25,13,9,1,1,0,0,41,25,17,7,8,3,6);
+INSERT INTO "match" VALUES(46,1,'2025-04-21',46,'O','BK40','GC88','6-7(3) 7-6(6) 6-1','R64',154,12,1,97,75,58,14,16,0,0,7,6,105,63,48,20,15,5,7);
+INSERT INTO "match" VALUES(47,1,'2025-04-21',47,'O','D923','B0BI','1-6 6-1 6-2','R64',98,1,5,72,45,30,13,11,9,12,0,1,72,53,26,12,11,5,10);
+INSERT INTO "match" VALUES(48,1,'2025-04-21',48,'O','D0F6','MQ75','7-5 4-6 6-4','R64',130,10,5,94,66,49,17,16,1,3,7,4,98,60,45,18,16,7,10);
+INSERT INTO "match" VALUES(49,1,'2025-04-21',49,'O','Z355','BD06','6-2 6-2','R64',70,10,1,42,26,21,11,8,0,0,1,1,51,30,18,8,8,5,9);
+INSERT INTO "match" VALUES(50,1,'2025-04-21',50,'O','FB98','O483','6-1 6-4','R64',75,5,0,54,31,27,9,9,3,4,2,2,50,23,16,10,8,4,8);
+INSERT INTO "match" VALUES(51,1,'2025-04-21',51,'O','RE44','MC65','W/O','R64',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(52,1,'2025-04-21',52,'O','C0E9','R0DG','6-2 RET','R64',43,0,1,28,19,13,6,4,3,3,0,0,24,13,8,5,4,0,2);
+INSERT INTO "match" VALUES(53,1,'2025-04-21',53,'O','MM58','DB63','W/O','R64',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(54,1,'2025-04-21',54,'O','S0S1','N0BS','4-6 7-6(5) 6-3','R64',139,8,5,97,65,50,18,15,9,11,0,2,97,77,54,9,16,2,5);
+INSERT INTO "match" VALUES(55,1,'2025-04-21',55,'O','C0DF','F0F1','7-6(4) 6-4','R64',105,11,2,81,46,32,17,11,4,7,2,4,71,49,33,8,11,3,7);
+INSERT INTO "match" VALUES(56,1,'2025-04-21',56,'O','RH16','RC91','6-3 6-4','R64',73,2,2,54,37,28,11,10,1,2,2,0,48,32,23,8,9,0,3);
+INSERT INTO "match" VALUES(57,1,'2025-04-21',57,'O','C0C8','AG37','7-6(5) 6-4','R64',113,5,0,77,57,45,11,11,5,5,8,3,67,50,37,12,11,5,6);
+INSERT INTO "match" VALUES(58,1,'2025-04-21',58,'O','C0AU','M0G4','6-3 6-4','R64',89,3,1,58,35,23,18,10,2,3,1,1,67,47,31,8,9,6,9);
+INSERT INTO "match" VALUES(59,1,'2025-04-21',59,'O','M0NI','Q02L','7-6(4) 6-1','R64',80,14,4,66,44,33,8,10,1,3,4,3,57,35,21,11,9,3,7);
+INSERT INTO "match" VALUES(60,1,'2025-04-21',60,'O','K0AH','C0NB','6-3 3-6 6-1','R64',101,7,3,78,44,36,18,13,3,4,2,5,79,52,36,11,12,3,6);
+INSERT INTO "match" VALUES(61,1,'2025-04-21',61,'O','BK92','P09Z','6-4 7-6(4)','R64',110,10,5,77,42,34,18,11,5,6,7,5,84,54,39,14,11,5,7);
+INSERT INTO "match" VALUES(62,1,'2025-04-21',62,'O','BM95','HB71','6-4 7-5','R64',87,6,1,60,35,27,16,11,1,2,4,0,62,31,23,16,11,3,6);
+INSERT INTO "match" VALUES(63,1,'2025-04-21',63,'O','DH50','BT72','6-2 6-3','R64',73,2,0,51,36,25,10,9,2,3,4,2,58,32,21,7,8,5,9);
+INSERT INTO "match" VALUES(64,1,'2025-04-21',64,'O','N0AE','O513','6-3 7-6(3)','R64',90,15,2,73,49,41,10,11,1,1,5,2,62,38,31,10,10,0,1);
+INSERT INTO "match" VALUES(65,1,'2025-04-21',65,'O','D0CO','BK40','7-6(2) RET','R32',58,3,0,41,30,22,6,6,1,2,2,1,43,30,23,2,6,5,6);
+INSERT INTO "match" VALUES(66,1,'2025-04-21',66,'O','DH58','SU55','6-3 7-6(3)','R32',89,1,0,62,34,27,21,10,1,1,6,5,65,41,28,15,11,1,3);
+INSERT INTO "match" VALUES(67,1,'2025-04-21',67,'O','M0EJ','TE51','7-5 7-6(3)','R32',114,4,0,80,61,47,8,12,4,5,1,6,79,45,35,15,12,6,8);
+INSERT INTO "match" VALUES(68,1,'2025-04-21',68,'O','PL56','KE29','6-3 3-6 6-2','R32',103,6,2,70,46,39,12,13,3,4,1,2,71,40,28,18,13,4,7);
+INSERT INTO "match" VALUES(69,1,'2025-04-21',69,'O','TD51','MP20','6-3 6-3','R32',78,3,2,55,31,27,13,9,2,2,4,1,65,46,30,6,9,7,10);
+INSERT INTO "match" VALUES(70,1,'2025-04-21',70,'O','D0F6','N771','2-6 6-4 6-4','R32',151,8,1,104,75,53,12,14,12,14,4,8,108,72,50,16,14,12,14);
+INSERT INTO "match" VALUES(71,1,'2025-04-21',71,'O','D875','F0BY','6-4 7-6(3)','R32',117,11,2,77,42,31,18,11,4,6,7,6,75,45,30,12,11,2,5);
+INSERT INTO "match" VALUES(72,1,'2025-04-21',72,'O','A0FC','D923','6-3 6-4','R32',104,6,3,77,42,31,21,10,5,5,0,5,64,38,23,15,9,2,4);
+INSERT INTO "match" VALUES(73,1,'2025-04-21',73,'O','Z355','DH50','2-6 7-6(3) 7-6(0)','R32',164,11,6,92,64,46,16,16,3,7,2,0,106,71,54,16,16,9,11);
+INSERT INTO "match" VALUES(74,1,'2025-04-21',74,'O','FB98','BM95','4-6 7-5 RET','R32',96,6,1,69,45,34,12,11,1,2,1,0,66,51,37,10,11,4,5);
+INSERT INTO "match" VALUES(75,1,'2025-04-21',75,'O','BK92','RE44','6-4 0-6 6-4','R32',82,12,6,71,38,29,18,13,2,5,12,2,67,48,38,11,13,4,6);
+INSERT INTO "match" VALUES(76,1,'2025-04-21',76,'O','MM58','C0C8','6-2 6-2','R32',63,2,2,45,29,22,11,8,1,1,2,1,42,23,11,9,8,1,5);
+INSERT INTO "match" VALUES(77,1,'2025-04-21',77,'O','M0NI','S0S1','6-1 6-4','R32',68,5,2,43,28,26,6,8,0,0,5,1,59,28,17,15,9,5,9);
+INSERT INTO "match" VALUES(78,1,'2025-04-21',78,'O','RH16','K0AH','6-3 6-3','R32',70,3,1,58,40,29,10,9,4,5,2,2,52,31,21,8,9,4,8);
+INSERT INTO "match" VALUES(79,1,'2025-04-21',79,'O','C0AU','C0DF','6-4 6-4','R32',96,4,3,71,55,38,11,10,4,4,1,0,64,41,28,13,10,3,5);
+INSERT INTO "match" VALUES(80,1,'2025-04-21',80,'O','N0AE','C0E9','7-5 6-3','R32',102,4,0,66,47,35,11,11,3,4,1,4,69,41,28,12,10,5,8);
+INSERT INTO "match" VALUES(81,1,'2025-04-21',81,'O','D0CO','PL56','6-2 6-2','R16',68,4,1,41,21,18,14,8,0,0,0,1,54,34,18,8,8,2,6);
+INSERT INTO "match" VALUES(82,1,'2025-04-21',82,'O','M0EJ','DH58','6-4 6-2','R16',83,3,1,48,33,26,11,9,0,0,1,1,58,35,25,9,9,7,10);
+INSERT INTO "match" VALUES(83,1,'2025-04-21',83,'O','D0F6','D875','5-7 7-6(7) 6-4','R16',142,8,2,97,75,58,14,17,0,1,14,6,94,55,49,22,17,3,4);
+INSERT INTO "match" VALUES(84,1,'2025-04-21',84,'O','A0FC','TD51','6-3 7-5','R16',97,6,1,76,40,28,21,11,6,7,7,0,51,32,24,9,10,2,5);
+INSERT INTO "match" VALUES(85,1,'2025-04-21',85,'O','C0AU','Z355','7-5 6-3','R16',89,1,2,70,42,34,16,11,1,1,1,0,47,38,30,5,10,1,3);
+INSERT INTO "match" VALUES(86,1,'2025-04-21',86,'O','RH16','FB98','7-5 6-4','R16',96,3,2,72,45,33,15,11,2,3,6,0,62,41,27,12,11,4,7);
+INSERT INTO "match" VALUES(87,1,'2025-04-21',87,'O','MM58','N0AE','3-6 6-1 6-4','R16',109,7,7,81,49,38,14,13,1,3,6,0,80,60,41,7,13,3,7);
+INSERT INTO "match" VALUES(88,1,'2025-04-21',88,'O','M0NI','BK92','6-3 6-2','R16',56,10,1,49,31,24,14,9,3,3,4,1,49,30,20,7,8,1,4);
+INSERT INTO "match" VALUES(89,1,'2025-04-21',89,'O','D0CO','A0FC','6-0 6-4','QF',77,4,1,43,29,22,11,8,0,0,3,1,57,26,14,15,8,6,10);
+INSERT INTO "match" VALUES(90,1,'2025-04-21',90,'O','RH16','MM58','6-3 7-5','QF',100,2,2,62,41,31,14,11,2,2,1,4,78,46,31,16,10,6,8);
+INSERT INTO "match" VALUES(91,1,'2025-04-21',91,'O','M0EJ','D0F6','6-4 6-3','QF',89,4,0,57,36,28,11,9,4,5,0,1,62,36,26,6,10,2,6);
+INSERT INTO "match" VALUES(92,1,'2025-04-21',92,'O','C0AU','M0NI','3-6 7-6(5) 6-2','QF',131,7,5,90,57,42,21,14,7,8,11,2,95,62,50,14,15,8,10);
+INSERT INTO "match" VALUES(93,1,'2025-04-21',93,'O','D0CO','M0EJ','6-3 7-6(4)','SF',117,3,1,73,49,38,14,11,2,3,3,2,73,53,37,10,10,4,6);
+INSERT INTO "match" VALUES(94,1,'2025-04-21',94,'O','RH16','C0AU','6-4 7-5','SF',114,4,3,85,57,36,12,11,15,18,2,3,65,40,27,11,11,4,9);
+INSERT INTO "match" VALUES(95,1,'2025-04-21',95,'O','RH16','D0CO','7-5 3-6 6-4','F',149,9,7,96,57,46,15,16,4,7,6,3,102,65,47,17,15,7,10);
+INSERT INTO "match" VALUES(96,2,'2025-10-27',1,'I','BK92','P09Z','6-4 6-3','R64',74,13,4,58,36,32,7,10,3,4,3,3,57,35,26,9,9,2,5);
+INSERT INTO "match" VALUES(97,2,'2025-10-27',2,'I','RE44','F0BY','6-1 6-4','R64',78,3,2,48,28,20,13,8,2,3,1,11,69,47,28,5,9,5,10);
+INSERT INTO "match" VALUES(98,2,'2025-10-27',3,'I','AE14','GC88','6-2 7-6(5)','R64',96,7,2,69,44,33,13,10,3,4,7,1,69,38,26,16,10,3,6);
+INSERT INTO "match" VALUES(99,2,'2025-10-27',4,'I','C0H0','D0FJ','7-6(5) 7-6(4)','R64',128,16,2,87,53,46,13,12,1,3,4,4,83,49,39,17,12,5,7);
+INSERT INTO "match" VALUES(100,2,'2025-10-27',5,'I','C0AU','D923','6-3 6-3','R64',76,2,2,55,29,18,16,9,6,8,0,0,55,31,15,12,9,7,12);
+INSERT INTO "match" VALUES(101,2,'2025-10-27',6,'I','C0E9','M0FH','6-1 6-4','R64',54,1,0,44,33,31,7,9,0,0,3,4,44,24,14,10,8,0,3);
+INSERT INTO "match" VALUES(102,2,'2025-10-27',7,'I','KI95','K0AZ','6-4 1-6 7-6(2)','R64',141,11,3,96,55,38,24,14,9,12,16,10,105,56,43,22,15,4,6);
+INSERT INTO "match" VALUES(103,2,'2025-10-27',8,'I','N771','B0BI','6-3 6-4','R64',84,3,2,73,51,34,9,10,5,7,0,1,48,36,21,6,9,2,6);
+INSERT INTO "match" VALUES(104,2,'2025-10-27',9,'I','RC91','M0CI','7-6(5) 7-6(4)','R64',126,16,1,94,61,49,15,12,4,5,5,2,84,47,34,23,12,2,3);
+INSERT INTO "match" VALUES(105,2,'2025-10-27',10,'I','T0HA','BT72','6-2 7-6(7)','R64',81,7,2,63,40,32,13,10,1,2,2,1,69,34,24,17,10,5,8);
+INSERT INTO "match" VALUES(106,2,'2025-10-27',11,'I','V832','A0GC','6-4 2-6 6-4','R64',113,7,3,95,54,36,25,14,9,12,13,8,80,46,38,15,14,5,8);
+INSERT INTO "match" VALUES(107,2,'2025-10-27',12,'I','KE29','Q02L','6-1 6-1','R64',60,2,0,39,25,19,10,7,0,0,1,1,43,27,14,4,7,2,7);
+INSERT INTO "match" VALUES(108,2,'2025-10-27',13,'I','BU13','M0QI','6-3 2-6 6-2','R64',112,4,5,78,50,36,10,12,4,8,0,5,81,49,29,16,13,4,10);
+INSERT INTO "match" VALUES(109,2,'2025-10-27',14,'I','D875','M0GZ','7-6(5) 6-1','R64',95,4,3,65,28,22,24,9,3,3,7,6,76,45,31,13,10,2,5);
+INSERT INTO "match" VALUES(110,2,'2025-10-27',15,'I','MP20','N0AE','6-2 7-5','R64',91,1,3,62,38,27,17,10,2,2,5,0,59,33,21,13,10,2,5);
+INSERT INTO "match" VALUES(111,2,'2025-10-27',16,'I','SU87','K0AH','6-2 6-3','R64',88,3,2,48,28,23,10,8,3,4,2,4,68,39,23,11,9,4,9);
+INSERT INTO "match" VALUES(112,2,'2025-10-27',17,'I','AG37','C0DF','6-7(2) 6-3 6-3','R64',138,11,7,80,44,37,21,15,3,5,8,1,100,63,39,19,15,5,10);
+INSERT INTO "match" VALUES(113,2,'2025-10-27',18,'I','MM58','MU94','6-1 6-3','R64',70,6,3,53,36,29,7,8,0,0,1,3,45,26,15,8,8,3,7);
+INSERT INTO "match" VALUES(114,2,'2025-10-27',19,'I','VA25','L0BV','6-1 6-3','R64',54,7,2,39,24,20,12,8,0,0,7,1,45,34,21,3,8,1,5);
+INSERT INTO "match" VALUES(115,2,'2025-10-27',20,'I','D0F6','GJ37','6-3 6-4','R64',71,11,0,57,37,31,14,10,2,2,4,3,50,30,23,9,9,0,2);
+INSERT INTO "match" VALUES(116,2,'2025-10-27',21,'I','F0FV','SU55','5-7 6-4 6-3','R64',124,2,2,96,69,53,12,15,5,7,9,9,86,46,33,19,16,2,6);
+INSERT INTO "match" VALUES(117,2,'2025-10-27',22,'I','MW02','O522','3-6 7-5 6-1','R64',127,5,5,72,40,30,23,14,0,1,11,9,89,58,45,12,14,5,8);
+INSERT INTO "match" VALUES(118,2,'2025-10-27',23,'I','U182','EA24','7-5 6-3','R64',114,2,1,69,34,22,22,11,3,5,5,2,63,37,27,9,10,7,11);
+INSERT INTO "match" VALUES(119,2,'2025-10-27',24,'I','DH50','R0EB','4-6 6-1 6-4','R64',118,3,2,81,49,35,17,13,4,7,5,3,80,58,44,14,14,3,4);
+INSERT INTO "match" VALUES(120,2,'2025-10-27',25,'I','FB98','V832','7-6(4) 6-2','R32',95,12,5,72,41,32,18,10,3,3,7,1,69,48,32,8,10,4,6);
+INSERT INTO "match" VALUES(121,2,'2025-10-27',26,'I','N771','A0E2','4-6 6-3 6-4','R32',142,3,1,92,52,41,24,15,4,5,8,2,95,58,37,22,14,5,7);
+INSERT INTO "match" VALUES(122,2,'2025-10-27',27,'I','S0S1','C0E9','7-6(4) 6-3','R32',92,3,3,64,43,37,15,11,1,1,5,0,64,36,29,17,10,2,3);
+INSERT INTO "match" VALUES(123,2,'2025-10-27',28,'I','RE44','T0HA','6-4 6-4','R32',80,7,7,66,39,34,10,10,8,9,5,4,62,34,22,16,10,4,7);
+INSERT INTO "match" VALUES(124,2,'2025-10-27',29,'I','S0AG','BU13','6-4 6-2','R32',87,0,2,48,31,24,12,9,0,0,2,2,70,42,25,15,9,8,11);
+INSERT INTO "match" VALUES(125,2,'2025-10-27',30,'I','Z355','U182','6-7(5) 6-1 7-5','R32',155,7,0,92,69,51,18,16,0,1,1,4,109,57,46,22,15,2,6);
+INSERT INTO "match" VALUES(126,2,'2025-10-27',31,'I','AE14','RH16','6-3 7-5','R32',85,10,1,63,37,32,14,11,4,5,7,2,56,36,29,7,10,2,5);
+INSERT INTO "match" VALUES(127,2,'2025-10-27',32,'I','AG37','MP20','5-7 7-6(5) 7-6(4)','R32',184,21,6,119,66,55,26,18,3,5,7,5,116,68,54,28,18,4,5);
+INSERT INTO "match" VALUES(128,2,'2025-10-27',33,'I','MM58','D875','W/O','R32',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(129,2,'2025-10-27',34,'I','DH50','C0H0','7-6(5) 6-4','R32',119,8,4,84,45,36,19,11,5,6,4,5,76,50,41,13,11,4,4);
+INSERT INTO "match" VALUES(130,2,'2025-10-27',35,'I','C0AU','KI95','7-5 1-6 7-6(4)','R32',146,14,2,102,62,39,23,15,7,11,3,4,117,69,46,22,16,9,12);
+INSERT INTO "match" VALUES(131,2,'2025-10-27',36,'I','VA25','RC91','6-7(9) 6-3 6-4','R32',174,6,8,108,56,42,30,15,11,13,8,5,109,65,49,19,16,6,11);
+INSERT INTO "match" VALUES(132,2,'2025-10-27',37,'I','DH58','D0F6','7-6(8) 4-6 6-3','R32',157,3,3,95,48,31,29,16,5,9,8,3,107,74,51,11,15,6,10);
+INSERT INTO "match" VALUES(133,2,'2025-10-27',38,'I','SU87','M0EJ','3-6 6-3 6-1','R32',116,4,0,70,40,30,20,12,3,4,1,4,70,43,34,11,13,1,5);
+INSERT INTO "match" VALUES(134,2,'2025-10-27',39,'I','KE29','F0FV','6-1 3-6 6-3','R32',110,8,2,68,49,39,10,13,0,1,11,4,79,47,32,16,12,7,10);
+INSERT INTO "match" VALUES(135,2,'2025-10-27',40,'I','BK92','MW02','6-3 7-5','R32',96,6,2,70,43,34,15,11,1,1,3,0,65,50,33,8,10,8,10);
+INSERT INTO "match" VALUES(136,2,'2025-10-27',41,'I','S0AG','C0AU','7-5 6-1','R16',85,4,2,49,35,29,6,10,1,3,0,2,64,38,21,10,9,3,8);
+INSERT INTO "match" VALUES(137,2,'2025-10-27',42,'I','Z355','DH50','6-2 6-4','R16',96,4,1,57,44,31,8,9,3,4,4,1,62,43,25,8,9,7,11);
+INSERT INTO "match" VALUES(138,2,'2025-10-27',43,'I','BK92','FB98','7-6(5) 6-2','R16',86,11,1,70,47,35,14,10,4,4,15,5,80,50,38,10,10,8,10);
+INSERT INTO "match" VALUES(139,2,'2025-10-27',44,'I','S0S1','RE44','7-6(6) 6-3','R16',95,15,0,58,43,34,13,10,0,0,6,0,72,40,27,21,11,4,6);
+INSERT INTO "match" VALUES(140,2,'2025-10-27',45,'I','DH58','KE29','6-2 6-2','R16',68,2,2,52,28,22,15,8,3,3,3,1,45,32,21,3,8,1,5);
+INSERT INTO "match" VALUES(141,2,'2025-10-27',46,'I','AG37','AE14','3-6 6-3 6-2','R16',131,7,3,74,45,39,16,13,4,5,6,6,94,62,45,12,13,7,10);
+INSERT INTO "match" VALUES(142,2,'2025-10-27',47,'I','MM58','SU87','3-6 7-6(5) 6-4','R16',159,8,4,96,58,42,22,15,6,8,8,3,111,77,59,14,16,5,7);
+INSERT INTO "match" VALUES(143,2,'2025-10-27',48,'I','VA25','N771','7-6(4) 6-4','R16',96,5,0,77,51,44,10,11,5,5,4,0,57,45,37,9,11,0,1);
+INSERT INTO "match" VALUES(144,2,'2025-10-27',49,'I','AG37','VA25','6-2 6-2','QF',78,3,0,39,27,24,9,8,2,2,5,2,61,36,19,12,8,4,8);
+INSERT INTO "match" VALUES(145,2,'2025-10-27',50,'I','BK92','DH58','6-7(5) 6-4 7-5','QF',142,16,4,111,70,62,13,17,2,2,12,9,106,56,43,29,17,3,5);
+INSERT INTO "match" VALUES(146,2,'2025-10-27',51,'I','S0AG','S0S1','6-3 6-3','QF',69,4,0,40,30,24,8,9,0,1,7,5,51,34,23,5,9,4,8);
+INSERT INTO "match" VALUES(147,2,'2025-10-27',52,'I','Z355','MM58','2-6 6-3 7-6(5)','QF',150,4,0,93,73,51,8,15,6,10,5,4,97,58,43,16,14,6,9);
+INSERT INTO "match" VALUES(148,2,'2025-10-27',53,'I','AG37','BK92','7-6(3) 6-4','SF',96,12,2,61,40,34,9,11,0,2,5,2,69,40,27,16,11,1,4);
+INSERT INTO "match" VALUES(149,2,'2025-10-27',54,'I','S0AG','Z355','6-0 6-1','SF',62,8,0,31,21,19,5,6,0,0,2,0,49,33,16,3,7,3,9);
+INSERT INTO "match" VALUES(150,2,'2025-10-27',55,'I','S0AG','AG37','6-4 7-6(4)','F',112,6,2,61,44,40,11,11,0,0,8,2,73,47,38,12,11,5,6);
+INSERT INTO "match" VALUES(151,3,'2025-03-17',1,'O','A0FC','WB32','7-6(3) 4-6 6-3','R128',150,16,3,91,50,41,24,16,0,2,5,0,114,84,56,15,15,10,12);
+INSERT INTO "match" VALUES(152,3,'2025-03-17',2,'O','BU13','BT72','7-6(2) 7-5','R128',143,9,2,98,57,41,20,12,8,10,5,5,82,53,33,15,12,4,7);
+INSERT INTO "match" VALUES(153,3,'2025-03-17',3,'O','Y09V','N771','6-4 6-2','R128',79,8,0,53,31,25,13,9,0,0,4,3,62,39,26,9,9,7,10);
+INSERT INTO "match" VALUES(154,3,'2025-03-17',4,'O','D0FJ','MO44','6-4 6-1','R128',63,6,1,43,31,30,6,9,0,0,1,3,41,22,14,11,8,2,5);
+INSERT INTO "match" VALUES(155,3,'2025-03-17',5,'O','DH50','SL28','7-6(3) 6-3','R128',90,4,0,71,49,37,14,10,7,7,12,3,66,35,29,13,11,2,4);
+INSERT INTO "match" VALUES(156,3,'2025-03-17',6,'O','D0F6','EA24','6-3 6-0','R128',74,6,1,49,35,27,5,8,3,4,0,1,42,20,9,9,7,3,8);
+INSERT INTO "match" VALUES(157,3,'2025-03-17',7,'O','F0BY','BM95','7-6(6) 2-6 6-4','R128',139,13,4,100,65,47,16,15,4,7,6,1,98,64,49,17,15,1,3);
+INSERT INTO "match" VALUES(158,3,'2025-03-17',8,'O','F0FV','T0HA','6-7(1) 6-3 6-4','R128',143,10,3,99,63,45,23,16,3,4,10,3,108,67,47,22,15,9,12);
+INSERT INTO "match" VALUES(159,3,'2025-03-17',9,'O','G09O','N732','6-4 3-1 RET','R128',61,2,2,45,22,14,15,7,1,2,1,3,47,27,18,8,7,2,5);
+INSERT INTO "match" VALUES(160,3,'2025-03-17',10,'O','M0NI','BD06','6-4 3-6 6-1','R128',113,23,3,86,57,48,9,13,7,8,1,1,71,53,38,7,13,2,5);
+INSERT INTO "match" VALUES(161,3,'2025-03-17',11,'O','O522','E865','6-3 7-6(4)','R128',85,15,5,66,42,39,13,11,1,1,6,0,65,45,37,9,10,3,4);
+INSERT INTO "match" VALUES(162,3,'2025-03-17',12,'O','SX50','B0CD','6-3 3-6 6-3','R128',133,12,2,102,73,52,12,14,7,9,6,0,78,53,36,15,13,2,5);
+INSERT INTO "match" VALUES(163,3,'2025-03-17',13,'O','SU87','N0BS','7-5 7-5','R128',131,2,5,71,38,33,18,12,3,4,1,3,78,38,27,21,12,4,7);
+INSERT INTO "match" VALUES(164,3,'2025-03-17',14,'O','TC61','GC88','3-6 6-4 7-5','R128',136,12,2,95,58,42,22,16,5,7,10,4,106,65,48,20,15,9,11);
+INSERT INTO "match" VALUES(165,3,'2025-03-17',15,'O','T0A1','C0E9','6-1 3-6 6-3','R128',112,11,1,79,50,37,17,13,4,6,5,3,76,40,28,16,12,5,9);
+INSERT INTO "match" VALUES(166,3,'2025-03-17',16,'O','W0BH','AE14','6-4 6-3','R128',71,5,1,52,35,32,10,10,4,4,6,0,48,36,27,5,9,1,3);
+INSERT INTO "match" VALUES(167,3,'2025-03-17',17,'O','BK92','B0BI','6-3 6-4','R128',69,9,3,54,34,30,10,10,2,3,0,1,51,40,25,6,9,3,6);
+INSERT INTO "match" VALUES(168,3,'2025-03-17',18,'O','CF59','O483','6-3 3-6 7-6(5)','R128',154,7,3,93,56,42,18,15,2,5,12,3,113,74,46,23,15,7,10);
+INSERT INTO "match" VALUES(169,3,'2025-03-17',19,'O','C0NB','C0DF','7-6(4) 7-6(2)','R128',107,3,1,84,64,46,10,12,3,5,15,2,79,53,36,16,12,2,4);
+INSERT INTO "match" VALUES(170,3,'2025-03-17',20,'O','GB88','V832','2-6 6-4 6-2','R128',103,12,2,76,43,34,15,13,3,6,4,2,77,45,34,11,13,2,6);
+INSERT INTO "match" VALUES(171,3,'2025-03-17',21,'O','HB64','SX91','6-3 6-4','R128',75,13,3,62,35,29,15,10,1,1,8,1,54,39,28,6,9,4,6);
+INSERT INTO "match" VALUES(172,3,'2025-03-17',22,'O','H0BH','M0JF','7-5 3-6 7-5','R128',147,4,2,95,67,44,13,16,6,11,14,3,107,70,44,18,17,4,10);
+INSERT INTO "match" VALUES(173,3,'2025-03-17',23,'O','KI95','K0AZ','6-4 6-4','R128',91,7,3,81,48,39,14,10,9,9,10,2,57,34,27,11,10,1,3);
+INSERT INTO "match" VALUES(174,3,'2025-03-17',24,'O','KE17','MK66','3-6 6-3 6-4','R128',103,13,3,75,58,45,7,14,1,3,7,2,84,60,39,13,14,4,7);
+INSERT INTO "match" VALUES(175,3,'2025-03-17',25,'O','MC65','M0CI','6-3 3-6 6-4','R128',105,15,3,83,54,42,15,14,5,7,5,0,93,71,45,12,14,4,7);
+INSERT INTO "match" VALUES(176,3,'2025-03-17',26,'O','MW02','B0PG','7-6(5) 6-4','R128',123,0,1,87,52,37,20,11,7,8,4,3,72,52,36,10,11,0,2);
+INSERT INTO "match" VALUES(177,3,'2025-03-17',27,'O','MP20','S0UV','6-4 6-4','R128',81,2,1,55,43,36,7,10,1,1,5,0,77,59,39,9,10,5,7);
+INSERT INTO "match" VALUES(178,3,'2025-03-17',28,'O','MU94','RC91','6-3 7-6(5)','R128',106,3,2,71,43,34,14,11,0,0,13,3,75,51,36,11,10,4,5);
+INSERT INTO "match" VALUES(179,3,'2025-03-17',29,'O','S0N0','Q02L','6-0 6-2','R128',61,11,1,42,28,24,6,7,0,0,5,2,42,25,13,5,7,1,6);
+INSERT INTO "match" VALUES(180,3,'2025-03-17',30,'O','S0JA','HD68','7-6(2) 3-6 6-2','R128',138,3,0,94,65,50,13,14,5,7,10,4,99,66,50,10,15,5,8);
+INSERT INTO "match" VALUES(181,3,'2025-03-17',31,'O','T0AP','B0GG','7-6(5) 6-2','R128',92,2,0,56,28,23,22,10,1,1,6,4,67,35,28,13,10,2,4);
+INSERT INTO "match" VALUES(182,3,'2025-03-17',32,'O','U182','H09P','2-6 7-6(5) 6-4','R128',144,8,6,100,65,43,14,15,6,12,8,2,98,72,41,17,15,7,12);
+INSERT INTO "match" VALUES(183,3,'2025-03-17',33,'O','Z355','F0BY','6-2 6-4','R64',74,8,1,49,44,36,2,9,2,2,4,3,59,40,23,10,9,2,5);
+INSERT INTO "match" VALUES(184,3,'2025-03-17',34,'O','FB98','SU87','7-6(2) 6-3','R64',108,9,0,62,39,32,16,11,0,0,10,0,87,66,46,7,10,6,7);
+INSERT INTO "match" VALUES(185,3,'2025-03-17',35,'O','M0NI','D0CO','7-6(2) 7-6(3)','R64',114,21,0,76,50,43,14,12,1,2,12,2,92,60,44,17,12,8,9);
+INSERT INTO "match" VALUES(186,3,'2025-03-17',36,'O','BU13','RE44','7-5 6-4','R64',99,6,4,74,45,34,8,11,5,8,8,1,68,45,32,15,11,1,2);
+INSERT INTO "match" VALUES(187,3,'2025-03-17',37,'O','DH58','Y09V','6-4 6-4','R64',85,5,0,48,32,28,12,10,0,0,6,1,65,40,30,11,10,3,5);
+INSERT INTO "match" VALUES(188,3,'2025-03-17',38,'O','O522','R0DG','4-6 6-3 7-6(5)','R64',123,21,4,93,63,48,20,16,1,2,1,5,93,59,45,20,15,2,3);
+INSERT INTO "match" VALUES(189,3,'2025-03-17',39,'O','W0BH','S0S1','7-6(3) 2-6 7-6(5)','R64',136,8,0,108,71,51,19,16,5,8,17,2,99,67,53,18,16,2,3);
+INSERT INTO "match" VALUES(190,3,'2025-03-17',40,'O','TD51','DH50','7-5 7-6(5)','R64',119,10,1,74,43,37,15,12,5,6,3,2,95,67,45,12,12,8,10);
+INSERT INTO "match" VALUES(191,3,'2025-03-17',41,'O','F0F1','D0F6','6-4 2-3 RET','R64',70,1,2,40,28,24,6,7,1,1,5,2,48,32,27,5,8,1,2);
+INSERT INTO "match" VALUES(192,3,'2025-03-17',42,'O','F0FV','HH26','6-4 6-3','R64',71,5,0,40,26,25,11,9,0,0,5,2,53,33,26,6,10,2,5);
+INSERT INTO "match" VALUES(193,3,'2025-03-17',43,'O','M0FH','A0FC','6-2 1-6 6-3','R64',104,5,6,77,53,36,13,12,4,6,6,3,74,45,29,15,12,2,5);
+INSERT INTO "match" VALUES(194,3,'2025-03-17',44,'O','SX50','P09Z','6-7(4) 6-3 7-5','R64',154,7,4,93,60,51,16,16,1,2,20,5,113,71,55,18,17,8,12);
+INSERT INTO "match" VALUES(195,3,'2025-03-17',45,'O','SU55','T0A1','6-3 6-7(1) 7-6(3)','R64',144,6,11,108,55,41,28,17,4,7,8,1,101,68,49,15,16,1,5);
+INSERT INTO "match" VALUES(196,3,'2025-03-17',46,'O','TC61','M0GZ','7-6(4) 7-6(1)','R64',97,7,1,66,43,38,16,12,0,1,15,2,82,59,43,12,12,2,3);
+INSERT INTO "match" VALUES(197,3,'2025-03-17',47,'O','BK40','G09O','4-6 6-3 6-3','R64',117,10,2,71,53,43,11,14,0,1,5,1,96,53,38,20,14,7,10);
+INSERT INTO "match" VALUES(198,3,'2025-03-17',48,'O','W09E','D0FJ','6-4 6-4','R64',92,15,0,66,40,32,16,10,3,3,7,0,66,41,27,14,10,6,8);
+INSERT INTO "match" VALUES(199,3,'2025-03-17',49,'O','GB88','A0E2','5-7 6-4 6-3','R64',138,3,2,89,58,40,17,15,3,5,8,2,100,67,43,18,16,3,7);
+INSERT INTO "match" VALUES(200,3,'2025-03-17',50,'O','D643','H0BH','6-0 7-6(1)','R64',79,9,1,49,39,33,8,9,2,2,2,1,63,43,29,7,9,7,10);
+INSERT INTO "match" VALUES(201,3,'2025-03-17',51,'O','RH16','KI95','3-6 6-4 6-4','R64',125,9,0,99,71,54,12,15,7,9,4,0,81,49,36,20,14,3,5);
+INSERT INTO "match" VALUES(202,3,'2025-03-17',52,'O','MU94','MM58','6-2 6-3','R64',78,0,0,53,31,24,15,9,2,2,1,4,53,31,19,10,8,8,11);
+INSERT INTO "match" VALUES(203,3,'2025-03-17',53,'O','TE51','T0AP','4-6 7-5 6-3','R64',134,9,3,86,59,44,17,16,4,6,7,0,82,50,35,19,15,5,8);
+INSERT INTO "match" VALUES(204,3,'2025-03-17',54,'O','PL56','BK92','5-7 7-5 6-4','R64',130,17,2,100,58,46,27,17,3,4,19,10,112,66,52,22,17,10,12);
+INSERT INTO "match" VALUES(205,3,'2025-03-17',55,'O','D875','C0NB','6-1 6-4','R64',68,4,1,54,32,26,14,9,2,2,3,2,49,33,20,6,8,4,7);
+INSERT INTO "match" VALUES(206,3,'2025-03-17',56,'O','M0EJ','HB64','3-6 7-6(4) 7-5','R64',147,4,3,120,79,53,25,16,3,5,17,7,105,61,50,20,17,4,6);
+INSERT INTO "match" VALUES(207,3,'2025-03-17',57,'O','AG37','S0N0','6-4 6-4','R64',87,6,2,50,37,32,9,10,1,1,4,3,71,50,35,8,10,7,9);
+INSERT INTO "match" VALUES(208,3,'2025-03-17',58,'O','KE29','KE17','7-6(3) 6-0','R64',76,8,1,53,40,34,8,9,2,2,8,2,64,40,25,10,9,3,6);
+INSERT INTO "match" VALUES(209,3,'2025-03-17',59,'O','C0AU','MP20','6-1 6-2','R64',60,4,1,42,29,22,9,7,1,1,0,2,50,35,19,4,8,2,7);
+INSERT INTO "match" VALUES(210,3,'2025-03-17',60,'O','K0AH','S0JA','6-4 6-2','R64',71,5,2,57,36,27,10,9,3,4,3,0,57,44,27,5,9,2,6);
+INSERT INTO "match" VALUES(211,3,'2025-03-17',61,'O','MC65','L0BV','6-1 3-6 7-6(8)','R64',126,14,3,89,59,47,16,14,4,5,8,3,97,53,36,26,14,4,6);
+INSERT INTO "match" VALUES(212,3,'2025-03-17',62,'O','TE30','MW02','5-7 6-3 7-5','R64',171,5,1,115,79,54,14,17,5,9,9,1,107,77,42,18,16,9,14);
+INSERT INTO "match" VALUES(213,3,'2025-03-17',63,'O','N0AE','CF59','6-4 4-6 6-3','R64',142,14,3,101,69,52,14,15,5,7,5,1,86,48,35,18,14,2,5);
+INSERT INTO "match" VALUES(214,3,'2025-03-17',64,'O','U182','M0QI','6-7(3) 7-5 6-3','R64',152,3,1,112,75,53,21,17,4,5,10,0,96,73,51,13,16,0,3);
+INSERT INTO "match" VALUES(215,3,'2025-03-17',65,'O','Z355','TC61','7-5 6-4','R32',87,6,0,55,42,32,10,11,0,1,11,0,60,42,29,9,11,2,5);
+INSERT INTO "match" VALUES(216,3,'2025-03-17',66,'O','FB98','SU55','7-5 6-3','R32',86,9,1,59,38,32,12,11,3,4,6,6,52,37,23,8,10,1,4);
+INSERT INTO "match" VALUES(217,3,'2025-03-17',67,'O','DH58','F0FV','5-7 7-5 6-3','R32',151,1,3,99,54,38,28,17,5,8,4,1,92,61,42,14,16,1,5);
+INSERT INTO "match" VALUES(218,3,'2025-03-17',68,'O','F0F1','TD51','7-6(11) 5-7 6-2','R32',175,21,4,100,68,49,19,16,2,5,11,5,142,79,52,30,16,10,14);
+INSERT INTO "match" VALUES(219,3,'2025-03-17',69,'O','M0FH','O522','7-6(1) 6-3','R32',74,8,1,58,39,35,13,11,0,0,19,2,59,44,34,6,10,0,1);
+INSERT INTO "match" VALUES(220,3,'2025-03-17',70,'O','BK40','BU13','6-4 6-4','R32',94,3,1,56,37,28,12,10,0,1,10,5,69,39,26,13,10,9,12);
+INSERT INTO "match" VALUES(221,3,'2025-03-17',71,'O','M0NI','SX50','6-4 6-4','R32',72,15,1,55,41,36,6,10,0,0,5,0,50,36,29,8,10,0,2);
+INSERT INTO "match" VALUES(222,3,'2025-03-17',72,'O','W09E','W0BH','7-6(6) 4-6 6-4','R32',139,10,0,104,70,50,18,16,4,7,15,0,99,64,45,21,16,1,4);
+INSERT INTO "match" VALUES(223,3,'2025-03-17',73,'O','D643','U182','6-1 7-6(1)','R32',105,10,2,64,49,39,7,10,0,1,3,2,64,32,23,15,9,4,7);
+INSERT INTO "match" VALUES(224,3,'2025-03-17',74,'O','RH16','TE30','6-4 7-6(4)','R32',95,11,2,62,39,34,17,11,3,3,7,1,74,55,37,13,11,3,4);
+INSERT INTO "match" VALUES(225,3,'2025-03-17',75,'O','K0AH','TE51','7-6(4) 6-3','R32',95,8,2,74,45,34,14,11,4,6,5,1,58,35,25,10,10,1,4);
+INSERT INTO "match" VALUES(226,3,'2025-03-17',76,'O','C0AU','PL56','6-2 7-6(4)','R32',91,1,2,59,44,28,10,10,0,3,3,3,61,36,22,9,10,3,8);
+INSERT INTO "match" VALUES(227,3,'2025-03-17',77,'O','D875','KE29','6-7(3) 6-4 7-5','R32',157,13,5,95,67,54,20,17,5,5,11,1,110,70,53,20,17,8,10);
+INSERT INTO "match" VALUES(228,3,'2025-03-17',78,'O','M0EJ','AG37','4-6 6-2 6-3','R32',146,1,1,93,60,40,20,14,6,8,11,4,90,70,46,8,13,10,14);
+INSERT INTO "match" VALUES(229,3,'2025-03-17',79,'O','N0AE','GB88','6-3 6-7(5) 6-3','R32',136,13,2,94,63,53,15,16,2,4,7,5,100,56,43,18,14,6,10);
+INSERT INTO "match" VALUES(230,3,'2025-03-17',80,'O','MC65','MU94','7-5 5-7 7-6(1)','R32',157,7,5,110,73,57,17,18,1,4,8,2,104,68,49,20,18,5,8);
+INSERT INTO "match" VALUES(231,3,'2025-03-17',81,'O','F0F1','Z355','3-6 6-3 6-4','R16',120,4,2,75,51,35,16,14,1,3,9,0,80,55,38,14,14,2,5);
+INSERT INTO "match" VALUES(232,3,'2025-03-17',82,'O','FB98','W09E','6-3 7-5','R16',94,4,0,57,44,24,9,11,3,3,2,0,54,41,25,6,10,7,9);
+INSERT INTO "match" VALUES(233,3,'2025-03-17',83,'O','D643','M0EJ','6-2 6-2','R16',83,1,1,46,32,24,8,8,0,1,1,3,56,39,20,6,8,7,12);
+INSERT INTO "match" VALUES(234,3,'2025-03-17',84,'O','C0AU','RH16','6-4 6-2','R16',86,6,1,53,37,28,11,9,0,0,4,3,66,52,28,9,9,7,10);
+INSERT INTO "match" VALUES(235,3,'2025-03-17',85,'O','BK40','DH58','6-3 7-6(7)','R16',120,7,2,85,49,36,16,11,7,9,7,3,65,41,25,15,10,4,7);
+INSERT INTO "match" VALUES(236,3,'2025-03-17',86,'O','D875','N0AE','6-4 7-5','R16',83,12,2,57,40,33,11,11,0,0,5,1,54,36,33,7,11,3,5);
+INSERT INTO "match" VALUES(237,3,'2025-03-17',87,'O','M0NI','M0FH','W/O','R16',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(238,3,'2025-03-17',88,'O','K0AH','MC65','6-4 2-6 6-4','R16',132,6,3,83,49,39,15,14,1,3,8,4,83,56,43,12,14,4,6);
+INSERT INTO "match" VALUES(239,3,'2025-03-17',89,'O','FB98','BK40','7-5 6-7(7) 7-5','QF',164,16,3,102,78,62,15,18,4,5,17,0,123,96,72,10,18,8,11);
+INSERT INTO "match" VALUES(240,3,'2025-03-17',90,'O','D643','K0AH','6-3 7-6(4)','QF',82,11,0,59,49,41,6,11,0,1,7,0,56,37,26,13,10,0,2);
+INSERT INTO "match" VALUES(241,3,'2025-03-17',91,'O','M0NI','F0F1','7-6(5) 6-1','QF',75,13,2,53,35,30,9,9,2,3,1,3,69,47,33,7,10,3,7);
+INSERT INTO "match" VALUES(242,3,'2025-03-17',92,'O','D875','C0AU','6-7(6) 6-4 7-6(3)','QF',168,7,3,108,66,53,21,17,3,5,7,1,115,73,51,23,17,10,13);
+INSERT INTO "match" VALUES(243,3,'2025-03-17',93,'O','M0NI','FB98','7-6(4) 4-6 7-6(4)','SF',145,25,4,101,73,60,15,17,1,2,14,3,114,79,63,16,17,2,2);
+INSERT INTO "match" VALUES(244,3,'2025-03-17',94,'O','D643','D875','6-2 6-3','SF',70,5,1,45,39,31,2,9,1,2,3,3,43,23,16,6,8,2,6);
+INSERT INTO "match" VALUES(245,3,'2025-03-17',95,'O','M0NI','D643','7-6(4) 7-6(4)','F',123,14,1,78,52,40,14,12,0,1,7,1,74,56,43,9,12,2,3);
+INSERT INTO "match" VALUES(246,4,'2025-03-03',1,'O','A0FC','K0AZ','6-3 5-7 6-4','R128',149,7,6,106,61,41,24,16,12,15,5,1,92,53,37,19,15,6,10);
+INSERT INTO "match" VALUES(247,4,'2025-03-03',2,'O','BT72','RC91','6-1 5-7 6-2','R128',140,6,2,108,78,53,15,14,11,13,5,1,104,67,37,18,13,7,12);
+INSERT INTO "match" VALUES(248,4,'2025-03-03',3,'O','B0CD','BM95','1-6 7-5 7-5','R128',150,1,2,100,51,36,24,15,11,15,0,1,102,72,44,18,16,4,8);
+INSERT INTO "match" VALUES(249,4,'2025-03-03',4,'O','F0FV','F0BY','6-2 1-6 6-3','R128',120,3,2,84,49,34,17,12,6,9,3,3,90,49,27,23,12,3,7);
+INSERT INTO "match" VALUES(250,4,'2025-03-03',5,'O','G09O','D0FJ','6-3 6-3','R128',82,5,1,60,28,25,13,9,4,5,2,0,57,36,22,8,9,2,6);
+INSERT INTO "match" VALUES(251,4,'2025-03-03',6,'O','G0GD','B0BI','3-6 6-1 6-4','R128',117,3,6,76,46,28,16,13,3,7,0,3,89,56,32,13,13,7,13);
+INSERT INTO "match" VALUES(252,4,'2025-03-03',7,'O','GB88','SU87','6-4 7-5','R128',102,2,1,60,27,16,15,11,0,5,1,2,68,43,22,7,11,4,11);
+INSERT INTO "match" VALUES(253,4,'2025-03-03',8,'O','HB64','CD85','6-3 6-4','R128',90,9,3,59,39,33,7,10,5,7,2,1,60,39,22,11,9,4,8);
+INSERT INTO "match" VALUES(254,4,'2025-03-03',9,'O','H0BH','S0H2','6-1 6-3','R128',64,1,1,48,35,22,6,8,2,4,0,5,53,35,16,7,8,3,9);
+INSERT INTO "match" VALUES(255,4,'2025-03-03',10,'O','L987','TC01','6-2 6-0','R128',56,1,0,45,34,27,5,7,3,3,2,1,46,21,13,7,7,4,9);
+INSERT INTO "match" VALUES(256,4,'2025-03-03',11,'O','MK66','DH50','2-6 6-3 6-2','R128',111,2,1,80,45,24,22,13,5,9,2,4,73,40,20,20,12,3,8);
+INSERT INTO "match" VALUES(257,4,'2025-03-03',12,'O','M0NI','EA24','6-4 7-6(6)','R128',112,9,6,79,44,32,17,11,7,10,4,3,63,44,26,9,11,1,5);
+INSERT INTO "match" VALUES(258,4,'2025-03-03',13,'O','MC65','SL28','6-4 6-4','R128',84,7,4,62,35,29,14,10,5,6,4,1,68,36,29,12,10,4,7);
+INSERT INTO "match" VALUES(259,4,'2025-03-03',14,'O','N0BS','T0HA','7-5 6-4','R128',115,4,1,64,42,31,12,11,1,2,1,7,87,49,30,20,11,4,7);
+INSERT INTO "match" VALUES(260,4,'2025-03-03',15,'O','V812','KE17','7-6(7) 3-0 RET','R128',83,2,3,59,35,25,13,8,5,7,6,2,59,34,23,9,7,1,4);
+INSERT INTO "match" VALUES(261,4,'2025-03-03',16,'O','W09E','Z0A1','7-5 6-1','R128',75,0,1,51,38,29,6,9,2,3,3,2,67,38,21,13,10,7,12);
+INSERT INTO "match" VALUES(262,4,'2025-03-03',17,'O','BU13','Q02L','7-6(2) 6-3','R128',106,5,1,75,46,34,17,11,4,5,5,1,73,46,28,15,10,5,7);
+INSERT INTO "match" VALUES(263,4,'2025-03-03',18,'O','B0EJ','V832','4-6 6-2 7-6(4)','R128',139,6,2,93,61,41,19,15,4,7,10,8,101,56,41,21,15,6,10);
+INSERT INTO "match" VALUES(264,4,'2025-03-03',19,'O','Y09V','B0NN','7-5 6-4','R128',102,1,1,62,33,27,17,11,0,1,3,4,68,37,29,12,11,4,7);
+INSERT INTO "match" VALUES(265,4,'2025-03-03',20,'O','D0F6','Z371','2-6 6-2 7-6(7)','R128',168,9,3,100,69,48,17,14,6,8,11,2,96,64,49,16,14,7,9);
+INSERT INTO "match" VALUES(266,4,'2025-03-03',21,'O','D923','BD06','6-4 1-6 7-6(4)','R128',149,1,1,86,57,36,13,14,3,8,2,2,102,61,37,23,15,4,8);
+INSERT INTO "match" VALUES(267,4,'2025-03-03',22,'O','GC88','BG23','7-5 7-6(3)','R128',110,11,1,72,45,33,16,12,1,2,2,2,93,46,32,24,12,5,7);
+INSERT INTO "match" VALUES(268,4,'2025-03-03',23,'O','GJ37','KI95','6-7(5) 6-4 6-3','R128',135,12,6,99,59,46,23,15,3,3,6,3,93,55,43,19,16,2,5);
+INSERT INTO "match" VALUES(269,4,'2025-03-03',24,'O','M0CI','MO44','6-3 6-2','R128',63,10,0,46,31,25,12,9,1,1,1,3,49,31,22,5,8,5,8);
+INSERT INTO "match" VALUES(270,4,'2025-03-03',25,'O','MW02','TC61','6-4 4-6 6-3','R128',160,4,2,87,52,36,19,15,1,4,2,4,106,50,33,29,14,11,15);
+INSERT INTO "match" VALUES(271,4,'2025-03-03',26,'O','N552','MU94','6-2 5-7 7-6(3)','R128',177,2,6,128,86,55,20,16,10,14,6,6,98,65,40,17,16,3,8);
+INSERT INTO "match" VALUES(272,4,'2025-03-03',27,'O','N771','N0BG','6-0 6-3','R128',64,6,1,43,26,23,10,8,1,1,1,2,48,23,14,8,7,6,10);
+INSERT INTO "match" VALUES(273,4,'2025-03-03',28,'O','O483','CF59','6-3 0-6 6-1','R128',116,2,3,62,40,25,12,11,5,8,2,3,85,57,33,15,11,9,13);
+INSERT INTO "match" VALUES(274,4,'2025-03-03',29,'O','SX50','O522','7-5 6-4','R128',86,2,4,63,44,34,10,11,3,4,12,5,63,40,31,7,11,3,6);
+INSERT INTO "match" VALUES(275,4,'2025-03-03',30,'O','SX91','MP20','4-6 7-5 7-6(6)','R128',175,14,6,118,69,53,21,17,11,15,2,2,118,82,49,21,17,11,15);
+INSERT INTO "match" VALUES(276,4,'2025-03-03',31,'O','S0ZE','C0E9','3-6 6-2 6-2','R128',111,5,3,79,55,35,11,12,11,15,4,7,80,33,22,17,13,2,9);
+INSERT INTO "match" VALUES(277,4,'2025-03-03',32,'O','WB08','BK92','6-3 3-6 6-3','R128',98,13,2,76,49,37,18,14,3,4,13,8,81,43,35,17,13,9,11);
+INSERT INTO "match" VALUES(278,4,'2025-03-03',33,'O','A0E2','HB64','6-4 6-2','R64',67,7,3,48,21,20,17,9,1,1,2,0,49,31,23,9,9,2,5);
+INSERT INTO "match" VALUES(279,4,'2025-03-03',34,'O','FB98','G0GD','6-3 7-5','R64',88,5,1,64,39,35,10,11,5,6,2,5,58,27,20,15,10,2,5);
+INSERT INTO "match" VALUES(280,4,'2025-03-03',35,'O','V812','D643','6-2 3-6 6-1','R64',121,4,4,82,58,35,17,12,2,4,0,3,73,49,31,7,12,3,8);
+INSERT INTO "match" VALUES(281,4,'2025-03-03',36,'O','A0FC','RE44','6-4 7-5','R64',107,0,0,70,30,17,22,11,7,11,2,5,61,33,20,10,11,4,10);
+INSERT INTO "match" VALUES(282,4,'2025-03-03',37,'O','DH58','GB88','6-2 6-2','R64',74,2,4,43,25,23,10,8,3,3,2,2,56,19,10,19,8,7,11);
+INSERT INTO "match" VALUES(283,4,'2025-03-03',38,'O','S0S1','N0BS','6-3 6-2','R64',77,5,1,56,35,28,10,9,0,0,0,0,46,30,18,9,8,3,6);
+INSERT INTO "match" VALUES(284,4,'2025-03-03',39,'O','D0CO','F0FV','6-4 6-0','R64',75,6,6,60,33,25,12,8,6,7,0,1,46,24,14,8,8,3,8);
+INSERT INTO "match" VALUES(285,4,'2025-03-03',40,'O','D875','BT72','6-3 6-4','R64',93,6,5,76,46,36,14,10,7,8,2,2,60,41,26,9,9,5,8);
+INSERT INTO "match" VALUES(286,4,'2025-03-03',41,'O','B0CD','AG37','6-4 6-2','R64',88,1,3,56,33,26,13,9,2,2,2,3,52,30,20,12,9,3,6);
+INSERT INTO "match" VALUES(287,4,'2025-03-03',42,'O','HB71','G09O','7-5 6-3','R64',89,13,1,76,46,36,15,11,4,4,1,4,56,23,22,16,10,1,3);
+INSERT INTO "match" VALUES(288,4,'2025-03-03',43,'O','KE29','M0NI','3-6 6-0 6-3','R64',119,2,2,76,46,33,15,12,5,7,7,5,80,42,29,16,12,7,12);
+INSERT INTO "match" VALUES(289,4,'2025-03-03',44,'O','MC65','K0AH','7-6(2) 7-6(4)','R64',120,4,9,80,42,34,22,12,4,6,4,2,89,55,38,18,12,5,7);
+INSERT INTO "match" VALUES(290,4,'2025-03-03',45,'O','C0AU','MK66','4-6 7-6(3) 6-1','R64',138,4,3,80,49,31,20,14,1,4,2,2,121,82,47,19,15,7,12);
+INSERT INTO "match" VALUES(291,4,'2025-03-03',46,'O','SU55','W09E','6-3 6-2','R64',76,2,3,69,42,29,11,9,8,10,1,2,47,30,17,4,8,1,6);
+INSERT INTO "match" VALUES(292,4,'2025-03-03',47,'O','TE30','L987','6-3 7-5','R64',92,6,2,74,41,30,21,11,2,2,3,2,66,41,28,12,10,2,4);
+INSERT INTO "match" VALUES(293,4,'2025-03-03',48,'O','N0AE','H0BH','7-5 6-1','R64',92,14,0,71,43,33,15,10,3,3,4,0,63,40,24,11,9,1,4);
+INSERT INTO "match" VALUES(294,4,'2025-03-03',49,'O','GJ37','Z355','4-6 7-6(5) 7-6(4)','R64',187,10,9,135,90,63,19,17,9,14,6,2,106,66,44,24,17,5,9);
+INSERT INTO "match" VALUES(295,4,'2025-03-03',50,'O','GC88','RH16','7-6(4) 3-6 6-2','R64',158,4,3,115,70,52,19,15,8,11,3,8,101,61,47,14,14,4,7);
+INSERT INTO "match" VALUES(296,4,'2025-03-03',51,'O','MM58','Y09V','6-2 6-2','R64',96,3,1,52,21,19,14,8,1,2,0,1,62,29,18,12,8,9,14);
+INSERT INTO "match" VALUES(297,4,'2025-03-03',52,'O','TE51','SX91','6-2 6-4','R64',87,4,1,49,34,26,12,9,2,2,2,5,71,42,33,8,9,5,8);
+INSERT INTO "match" VALUES(298,4,'2025-03-03',53,'O','PL56','B0EJ','6-3 6-1','R64',69,4,1,41,22,16,14,8,1,2,1,3,60,34,21,7,8,2,7);
+INSERT INTO "match" VALUES(299,4,'2025-03-03',54,'O','R0DG','MW02','6-2 6-4','R64',106,2,1,50,34,24,9,9,3,5,2,2,63,43,21,10,9,6,11);
+INSERT INTO "match" VALUES(300,4,'2025-03-03',55,'O','M0EJ','SX50','7-5 5-7 6-2','R64',162,5,4,107,68,46,17,16,4,8,2,7,100,57,34,20,16,6,12);
+INSERT INTO "match" VALUES(301,4,'2025-03-03',56,'O','TD51','D923','7-6(4) 7-6(7)','R64',129,5,5,99,55,38,22,12,2,7,2,3,89,57,31,18,12,5,10);
+INSERT INTO "match" VALUES(302,4,'2025-03-03',57,'O','HH26','N552','6-4 6-3','R64',88,7,3,70,35,27,17,10,4,6,1,2,47,29,17,8,9,1,5);
+INSERT INTO "match" VALUES(303,4,'2025-03-03',58,'O','WB08','M0FH','4-6 4-2 RET','R64',56,4,2,42,22,19,10,8,2,4,5,3,44,30,24,4,8,0,2);
+INSERT INTO "match" VALUES(304,4,'2025-03-03',59,'O','F0F1','D0F6','6-2 6-2','R64',67,0,0,37,25,22,7,8,0,1,3,2,55,32,15,9,8,3,8);
+INSERT INTO "match" VALUES(305,4,'2025-03-03',60,'O','N771','L0BV','3-6 6-4 7-5','R64',143,3,2,110,66,45,23,15,10,12,4,3,93,47,34,28,16,3,6);
+INSERT INTO "match" VALUES(306,4,'2025-03-03',61,'O','P09Z','BU13','7-6(4) 7-5','R64',130,5,1,83,52,41,16,12,4,5,2,4,85,51,36,18,12,4,6);
+INSERT INTO "match" VALUES(307,4,'2025-03-03',62,'O','BK40','O483','6-2 7-6(2)','R64',94,7,1,63,40,28,17,10,1,1,4,3,61,40,28,9,10,1,3);
+INSERT INTO "match" VALUES(308,4,'2025-03-03',63,'O','M0GZ','M0CI','6-4 RET','R64',42,10,3,28,16,13,8,5,2,2,3,3,35,19,11,9,5,4,5);
+INSERT INTO "match" VALUES(309,4,'2025-03-03',64,'O','M0QI','S0ZE','6-3 6-4','R64',108,2,3,88,52,35,20,10,5,6,3,1,62,37,25,12,9,4,7);
+INSERT INTO "match" VALUES(310,4,'2025-03-03',65,'O','A0E2','SU55','6-2 6-4','R32',83,2,5,63,45,31,10,9,3,4,2,8,59,31,23,10,9,4,8);
+INSERT INTO "match" VALUES(311,4,'2025-03-03',66,'O','FB98','TE30','4-6 6-3 6-1','R32',114,12,3,80,49,39,14,13,5,7,3,5,89,50,27,21,13,4,9);
+INSERT INTO "match" VALUES(312,4,'2025-03-03',67,'O','DH58','HB71','6-4 6-0','R32',73,2,3,49,20,16,19,8,1,1,7,1,43,25,14,7,8,0,4);
+INSERT INTO "match" VALUES(313,4,'2025-03-03',68,'O','S0S1','KE29','6-3 7-5','R32',95,8,3,77,48,33,16,11,4,5,7,3,61,40,28,8,10,7,10);
+INSERT INTO "match" VALUES(314,4,'2025-03-03',69,'O','D0CO','B0CD','7-5 6-4','R32',101,4,3,56,30,27,16,11,1,2,1,4,81,44,25,21,11,2,5);
+INSERT INTO "match" VALUES(315,4,'2025-03-03',70,'O','D875','MC65','7-6(4) 4-6 7-6(2)','R32',181,3,7,116,65,44,33,17,6,9,8,6,122,73,53,27,17,9,11);
+INSERT INTO "match" VALUES(316,4,'2025-03-03',71,'O','C0AU','V812','6-3 6-4','R32',101,2,2,71,38,25,20,10,4,5,1,2,57,37,24,9,9,1,4);
+INSERT INTO "match" VALUES(317,4,'2025-03-03',72,'O','N0AE','A0FC','6-2 6-4','R32',74,4,0,45,27,24,13,9,1,1,2,5,56,32,23,9,9,3,6);
+INSERT INTO "match" VALUES(318,4,'2025-03-03',73,'O','MM58','M0QI','2-0 RET','R32',10,1,0,5,4,3,1,1,0,0,0,1,7,3,1,1,1,0,1);
+INSERT INTO "match" VALUES(319,4,'2025-03-03',74,'O','TE51','BK40','6-3 6-3','R32',68,0,2,44,26,24,12,9,0,0,6,1,52,37,26,4,9,3,6);
+INSERT INTO "match" VALUES(320,4,'2025-03-03',75,'O','PL56','N771','6-3 7-5','R32',92,6,3,58,30,21,14,10,0,3,1,7,70,35,21,13,11,6,12);
+INSERT INTO "match" VALUES(321,4,'2025-03-03',76,'O','R0DG','HH26','5-7 6-4 7-5','R32',155,6,9,110,56,42,28,17,7,10,10,5,104,55,39,24,17,6,10);
+INSERT INTO "match" VALUES(322,4,'2025-03-03',77,'O','F0F1','M0EJ','3-6 7-6(4) 6-3','R32',151,6,3,103,65,44,20,16,3,7,6,3,90,54,38,19,14,3,6);
+INSERT INTO "match" VALUES(323,4,'2025-03-03',78,'O','WB08','TD51','6-4 7-6(6)','R32',113,16,2,71,37,28,22,11,4,6,4,2,87,50,32,17,11,9,12);
+INSERT INTO "match" VALUES(324,4,'2025-03-03',79,'O','GC88','P09Z','5-7 6-3 6-3','R32',152,7,2,111,67,43,28,15,14,15,5,4,86,38,27,28,15,5,8);
+INSERT INTO "match" VALUES(325,4,'2025-03-03',80,'O','GJ37','M0GZ','7-6(3) 6-3','R32',76,10,1,60,32,26,21,11,1,2,5,5,55,28,22,17,10,3,5);
+INSERT INTO "match" VALUES(326,4,'2025-03-03',81,'O','A0E2','D875','6-1 6-1','R16',74,6,2,40,30,23,7,7,3,3,1,4,63,34,17,11,7,9,14);
+INSERT INTO "match" VALUES(327,4,'2025-03-03',82,'O','D0CO','FB98','7-5 6-4','R16',78,8,2,57,35,32,10,11,0,1,6,0,57,40,30,8,11,1,4);
+INSERT INTO "match" VALUES(328,4,'2025-03-03',83,'O','C0AU','DH58','7-5 6-3','R16',110,2,5,78,45,27,18,10,11,14,2,1,67,34,22,9,11,1,7);
+INSERT INTO "match" VALUES(329,4,'2025-03-03',84,'O','S0S1','N0AE','7-6(6) 6-1','R16',94,6,1,61,40,29,14,10,3,4,0,1,62,30,18,17,9,2,5);
+INSERT INTO "match" VALUES(330,4,'2025-03-03',85,'O','MM58','PL56','6-4 6-0','R16',74,8,4,51,31,22,9,8,3,5,4,4,55,37,19,5,8,2,8);
+INSERT INTO "match" VALUES(331,4,'2025-03-03',86,'O','R0DG','TE51','6-4 6-4','R16',88,3,0,58,41,30,11,10,5,6,2,1,61,37,22,13,10,2,5);
+INSERT INTO "match" VALUES(332,4,'2025-03-03',87,'O','F0F1','GC88','6-2 2-6 6-3','R16',112,4,0,81,51,32,21,13,4,6,3,1,88,50,35,16,12,2,5);
+INSERT INTO "match" VALUES(333,4,'2025-03-03',88,'O','GJ37','WB08','7-6(4) 6-1','R16',86,3,0,61,42,34,13,10,1,1,5,1,54,23,19,13,9,2,4);
+INSERT INTO "match" VALUES(334,4,'2025-03-03',89,'O','A0E2','C0AU','6-3 7-6(4)','QF',103,5,5,73,48,36,15,11,8,9,1,4,73,57,38,5,10,1,3);
+INSERT INTO "match" VALUES(335,4,'2025-03-03',90,'O','MM58','F0F1','6-4 2-6 7-6(7)','QF',145,5,3,88,54,34,25,15,4,8,2,7,106,61,45,21,15,8,11);
+INSERT INTO "match" VALUES(336,4,'2025-03-03',91,'O','D0CO','S0S1','6-4 7-5','QF',99,3,1,68,49,33,14,11,0,1,3,5,75,42,28,16,11,2,5);
+INSERT INTO "match" VALUES(337,4,'2025-03-03',92,'O','R0DG','GJ37','5-7 6-0 6-3','QF',128,6,0,74,51,39,11,14,1,4,3,3,95,60,38,10,13,9,15);
+INSERT INTO "match" VALUES(338,4,'2025-03-03',93,'O','D0CO','A0E2','6-1 0-6 6-4','SF',104,4,2,69,47,30,11,12,5,9,3,4,70,39,25,14,11,1,5);
+INSERT INTO "match" VALUES(339,4,'2025-03-03',94,'O','R0DG','MM58','7-5 6-4','SF',99,1,2,70,47,34,14,11,1,2,2,0,60,30,20,16,11,1,4);
+INSERT INTO "match" VALUES(340,4,'2025-03-03',95,'O','D0CO','R0DG','6-2 6-2','F',69,10,0,46,26,24,10,8,0,0,1,2,52,34,20,7,8,3,7);
+INSERT INTO "match" VALUES(341,5,'2025-04-07',1,'O','BT72','R0DG','6-2 3-0 RET','R64',42,6,0,37,27,22,4,6,2,2,0,2,30,16,11,3,5,1,4);
+INSERT INTO "match" VALUES(342,5,'2025-04-07',2,'O','F0F1','GJ37','6-7(3) 6-4 6-2','R64',159,7,6,111,69,54,23,15,5,5,6,7,120,75,55,18,15,13,16);
+INSERT INTO "match" VALUES(343,5,'2025-04-07',3,'O','TD51','KI95','6-2 5-7 7-6(5)','R64',151,7,3,109,62,41,26,16,5,8,6,4,112,62,41,26,16,7,11);
+INSERT INTO "match" VALUES(344,5,'2025-04-07',4,'O','D875','J551','6-3 6-4','R64',106,1,4,75,39,28,17,10,7,9,4,3,63,41,22,12,9,8,12);
+INSERT INTO "match" VALUES(345,5,'2025-04-07',5,'O','BD06','N0AE','6-2 6-4','R64',86,3,2,58,42,31,8,9,3,4,1,0,53,35,19,7,9,4,8);
+INSERT INTO "match" VALUES(346,5,'2025-04-07',6,'O','C0E9','L987','6-4 6-2','R64',73,2,3,54,28,19,14,9,1,3,3,1,57,42,20,7,9,5,10);
+INSERT INTO "match" VALUES(347,5,'2025-04-07',7,'O','EA24','MW02','4-6 6-1 6-4','R64',140,3,2,80,52,37,17,14,5,7,2,2,84,49,31,18,13,3,7);
+INSERT INTO "match" VALUES(348,5,'2025-04-07',8,'O','M0FH','B0BI','3-6 6-3 6-2','R64',114,4,3,85,45,31,15,13,5,10,2,2,78,54,30,9,13,5,12);
+INSERT INTO "match" VALUES(349,5,'2025-04-07',9,'O','MO44','SU87','6-4 1-6 6-2','R64',133,0,1,66,51,36,7,12,1,3,7,4,87,53,41,12,13,8,11);
+INSERT INTO "match" VALUES(350,5,'2025-04-07',10,'O','P09Z','HH26','3-6 7-6(2) 6-4','R64',170,3,6,107,68,52,19,15,5,6,7,3,116,67,50,25,16,8,9);
+INSERT INTO "match" VALUES(351,5,'2025-04-07',11,'O','MM58','KE29','7-5 4-6 6-4','R64',172,4,5,96,48,35,16,16,8,16,1,2,119,85,44,13,16,11,20);
+INSERT INTO "match" VALUES(352,5,'2025-04-07',12,'O','DH50','S0S1','6-7(2) 6-2 6-1','R64',120,2,0,90,52,30,23,14,3,7,5,3,74,48,24,10,13,3,11);
+INSERT INTO "match" VALUES(353,5,'2025-04-07',13,'O','M0EJ','Y09V','4-6 7-5 6-3','R64',159,1,1,90,69,49,11,16,0,2,4,3,101,56,39,22,15,3,6);
+INSERT INTO "match" VALUES(354,5,'2025-04-07',14,'O','AE14','AG37','7-6(5) 6-3','R64',119,6,0,79,50,37,11,11,6,9,4,3,70,50,33,7,10,5,9);
+INSERT INTO "match" VALUES(355,5,'2025-04-07',15,'O','BK40','N0BS','6-4 6-4','R64',106,2,4,69,44,29,9,10,4,7,0,2,66,43,24,9,10,6,11);
+INSERT INTO "match" VALUES(356,5,'2025-04-07',16,'O','C0AU','F510','6-0 6-3','R64',62,4,0,37,27,22,8,7,2,2,0,6,59,31,16,12,8,3,8);
+INSERT INTO "match" VALUES(357,5,'2025-04-07',17,'O','GC88','SU55','6-3 7-6(5)','R64',108,1,0,95,54,33,25,11,5,6,6,4,60,31,23,16,10,0,2);
+INSERT INTO "match" VALUES(358,5,'2025-04-07',18,'O','L0BV','K0AH','6-3 7-6(7)','R64',86,5,0,65,41,36,13,11,1,2,5,1,68,48,31,14,10,1,3);
+INSERT INTO "match" VALUES(359,5,'2025-04-07',19,'O','MC65','M0CI','4-6 6-1 6-1','R64',102,4,3,72,39,30,20,12,4,5,2,3,81,53,32,11,12,9,14);
+INSERT INTO "match" VALUES(360,5,'2025-04-07',20,'O','MP20','U182','6-4 6-4','R64',92,2,2,63,42,31,14,10,3,3,0,2,63,40,28,11,10,2,4);
+INSERT INTO "match" VALUES(361,5,'2025-04-07',21,'O','TE30','W367','1-6 7-5 7-5','R64',147,3,5,101,57,38,19,15,7,12,8,4,115,68,42,24,16,8,13);
+INSERT INTO "match" VALUES(362,5,'2025-04-07',22,'O','G628','A0FC','6-3 4-6 6-4','R64',154,1,5,99,48,34,29,14,8,11,5,3,95,50,34,21,15,5,10);
+INSERT INTO "match" VALUES(363,5,'2025-04-07',23,'O','TC61','M0GZ','6-4 6-3','R64',92,1,1,49,29,22,15,9,0,0,9,4,81,53,30,17,10,10,13);
+INSERT INTO "match" VALUES(364,5,'2025-04-07',24,'O','VA25','SL28','6-2 6-1','R64',58,5,0,41,27,23,9,8,0,0,3,3,48,31,16,7,7,6,10);
+INSERT INTO "match" VALUES(365,5,'2025-04-07',25,'O','A0E2','C0AU','3-6 6-0 6-1','R32',98,1,3,76,41,28,19,11,5,7,2,5,55,33,17,9,11,2,8);
+INSERT INTO "match" VALUES(366,5,'2025-04-07',26,'O','TE30','D643','6-3 6-4','R32',87,2,2,59,37,30,11,10,2,3,3,2,56,30,20,11,9,5,8);
+INSERT INTO "match" VALUES(367,5,'2025-04-07',27,'O','RH16','BD06','6-2 6-1','R32',68,6,0,39,29,25,7,8,0,0,0,1,51,31,15,9,7,4,8);
+INSERT INTO "match" VALUES(368,5,'2025-04-07',28,'O','RE44','MC65','6-4 7-6(2)','R32',103,5,1,66,36,26,19,11,3,5,10,6,77,41,33,12,11,5,8);
+INSERT INTO "match" VALUES(369,5,'2025-04-07',29,'O','DH58','M0FH','3-6 6-0 6-3','R32',108,3,2,80,42,33,20,12,4,5,5,3,75,47,33,10,12,1,5);
+INSERT INTO "match" VALUES(370,5,'2025-04-07',30,'O','MM58','MP20','7-6(6) 5-7 6-2','R32',168,7,8,103,58,42,19,16,2,6,1,4,122,69,42,26,16,5,10);
+INSERT INTO "match" VALUES(371,5,'2025-04-07',31,'O','F0F1','C0E9','6-2 6-4','R32',70,1,1,53,32,24,14,9,2,2,0,2,54,28,15,15,9,5,8);
+INSERT INTO "match" VALUES(372,5,'2025-04-07',32,'O','M0EJ','L0BV','1-6 7-5 6-2','R32',139,3,0,76,53,32,16,14,2,6,4,8,105,60,40,17,13,14,18);
+INSERT INTO "match" VALUES(373,5,'2025-04-07',33,'O','P09Z','TD51','3-6 6-3 6-3','R32',124,7,6,79,52,35,9,13,4,8,7,2,99,51,32,23,14,10,16);
+INSERT INTO "match" VALUES(374,5,'2025-04-07',34,'O','D875','VA25','4-6 6-3 6-1','R32',111,4,3,79,45,31,16,13,7,11,0,1,75,56,30,5,13,3,10);
+INSERT INTO "match" VALUES(375,5,'2025-04-07',35,'O','AE14','G628','7-5 5-7 6-2','R32',156,6,4,104,55,43,18,16,8,13,1,6,89,48,30,19,16,4,11);
+INSERT INTO "match" VALUES(376,5,'2025-04-07',36,'O','BT72','MO44','7-5 6-7(4) 6-4','R32',188,10,4,113,67,45,26,17,6,9,3,5,132,94,57,20,17,12,17);
+INSERT INTO "match" VALUES(377,5,'2025-04-07',37,'O','DH50','EA24','7-6(2) 6-3','R32',113,4,2,70,41,31,17,10,7,8,6,2,82,44,28,17,11,6,9);
+INSERT INTO "match" VALUES(378,5,'2025-04-07',38,'O','BK40','Z355','2-6 6-3 7-5','R32',148,4,0,87,56,39,17,15,2,5,6,6,85,60,38,16,14,4,7);
+INSERT INTO "match" VALUES(379,5,'2025-04-07',39,'O','D0CO','GC88','6-1 6-1','R32',61,5,2,43,27,22,9,7,4,4,0,0,46,21,14,6,7,5,10);
+INSERT INTO "match" VALUES(380,5,'2025-04-07',40,'O','TE51','TC61','4-6 6-4 6-2','R32',121,6,2,82,40,32,25,14,5,7,5,1,78,48,34,15,14,5,9);
+INSERT INTO "match" VALUES(381,5,'2025-04-07',41,'O','A0E2','AE14','6-3 6-1','R16',86,0,2,59,35,21,15,8,9,10,0,2,52,24,12,13,8,2,7);
+INSERT INTO "match" VALUES(382,5,'2025-04-07',42,'O','P09Z','RH16','6-4 3-6 7-5','R16',177,4,5,117,73,54,19,15,12,14,2,2,123,85,58,18,16,12,15);
+INSERT INTO "match" VALUES(383,5,'2025-04-07',43,'O','DH50','D0CO','6-3 6-7(6) 6-4','R16',166,1,0,118,74,44,26,16,12,16,5,10,98,47,30,25,15,7,13);
+INSERT INTO "match" VALUES(384,5,'2025-04-07',44,'O','TE51','BT72','6-1 6-1','R16',67,3,2,56,32,23,11,7,5,6,0,2,46,29,12,6,7,1,7);
+INSERT INTO "match" VALUES(385,5,'2025-04-07',45,'O','F0F1','RE44','6-2 6-3','R16',61,4,2,42,26,21,9,8,0,1,2,3,53,32,19,6,9,4,9);
+INSERT INTO "match" VALUES(386,5,'2025-04-07',46,'O','DH58','MM58','6-2 6-2','R16',72,3,3,46,24,14,12,8,1,4,3,3,52,29,13,6,8,5,12);
+INSERT INTO "match" VALUES(387,5,'2025-04-07',47,'O','M0EJ','BK40','6-3 6-3','R16',94,0,1,50,37,27,10,9,0,0,3,2,68,46,31,7,9,7,10);
+INSERT INTO "match" VALUES(388,5,'2025-04-07',48,'O','D875','TE30','6-3 3-6 6-2','R16',116,7,1,68,47,36,11,13,2,5,0,5,106,68,37,18,13,11,16);
+INSERT INTO "match" VALUES(389,5,'2025-04-07',49,'O','A0E2','F0F1','4-6 7-5 6-3','QF',143,3,7,101,62,43,19,16,7,11,0,5,103,62,45,13,15,9,14);
+INSERT INTO "match" VALUES(390,5,'2025-04-07',50,'O','M0EJ','TE51','1-6 6-3 6-4','QF',141,1,1,102,75,47,15,13,14,17,1,7,85,42,28,23,13,3,6);
+INSERT INTO "match" VALUES(391,5,'2025-04-07',51,'O','DH58','D875','6-0 6-0','QF',44,0,0,31,16,12,12,6,0,0,0,1,32,19,6,2,6,2,8);
+INSERT INTO "match" VALUES(392,5,'2025-04-07',52,'O','DH50','P09Z','6-3 6-2','QF',69,1,0,47,32,26,11,9,0,0,9,4,57,38,24,8,8,6,9);
+INSERT INTO "match" VALUES(393,5,'2025-04-07',53,'O','A0E2','DH50','7-6(2) 6-4','SF',129,0,1,73,48,31,16,11,5,7,3,3,109,74,47,12,11,16,19);
+INSERT INTO "match" VALUES(394,5,'2025-04-07',54,'O','M0EJ','DH58','1-6 6-4 7-6(4)','SF',158,2,1,93,62,37,12,15,5,12,1,3,94,49,36,18,14,4,9);
+INSERT INTO "match" VALUES(395,5,'2025-04-07',55,'O','A0E2','M0EJ','3-6 6-1 6-0','F',107,3,3,78,56,39,11,11,7,9,3,1,68,43,21,13,11,2,8);
+INSERT INTO "match" VALUES(396,6,'2025-05-05',1,'O','BD06','A0FC','6-4 6-3','R128',114,1,2,76,52,33,13,10,7,9,4,2,55,35,22,5,9,4,8);
+INSERT INTO "match" VALUES(397,6,'2025-05-05',2,'O','BK92','SX50','6-3 7-6(4)','R128',97,6,3,71,45,34,16,11,5,7,1,2,76,52,32,14,10,4,7);
+INSERT INTO "match" VALUES(398,6,'2025-05-05',3,'O','D0C1','S0H2','6-2 6-4','R128',86,5,2,54,33,29,11,9,3,3,2,3,65,32,19,16,9,4,7);
+INSERT INTO "match" VALUES(399,6,'2025-05-05',4,'O','F0BY','F510','6-2 6-3','R128',80,1,5,53,29,20,12,9,2,4,1,1,55,27,14,12,8,3,8);
+INSERT INTO "match" VALUES(400,6,'2025-05-05',5,'O','G0GD','RC91','7-6(4) 7-6(4)','R128',133,5,6,106,63,45,21,12,7,8,8,2,84,50,37,16,12,1,2);
+INSERT INTO "match" VALUES(401,6,'2025-05-05',6,'O','GC88','D0F6','3-6 6-3 6-4','R128',119,2,1,85,49,31,27,14,2,3,4,1,79,55,38,16,14,1,3);
+INSERT INTO "match" VALUES(402,6,'2025-05-05',7,'O','J551','G09O','7-6(4) 6-4','R128',111,4,1,70,51,40,12,11,2,2,1,3,80,53,38,14,11,7,8);
+INSERT INTO "match" VALUES(403,6,'2025-05-05',8,'O','M0CI','F0FV','6-3 7-6(4)','R128',87,3,1,67,40,30,19,11,3,4,4,4,68,37,23,18,10,1,3);
+INSERT INTO "match" VALUES(404,6,'2025-05-05',9,'O','MO44','B0GG','6-4 6-2','R128',92,2,0,54,40,28,9,9,4,5,4,5,63,35,24,10,9,3,7);
+INSERT INTO "match" VALUES(405,6,'2025-05-05',10,'O','MU94','BS86','4-6 6-2 7-5','R128',186,8,3,94,56,41,18,15,6,9,1,1,109,72,44,17,15,15,20);
+INSERT INTO "match" VALUES(406,6,'2025-05-05',11,'O','N0BG','C0E9','6-3 6-4','R128',88,1,5,56,27,20,19,10,0,1,2,5,64,31,21,16,9,6,9);
+INSERT INTO "match" VALUES(407,6,'2025-05-05',12,'O','N0BS','C0NB','6-3 6-3','R128',84,2,1,60,38,26,13,9,4,5,0,2,51,38,24,5,9,0,4);
+INSERT INTO "match" VALUES(408,6,'2025-05-05',13,'O','O513','CF59','6-3 RET','R128',50,3,2,25,12,11,9,5,0,0,0,2,41,19,11,11,4,4,5);
+INSERT INTO "match" VALUES(409,6,'2025-05-05',14,'O','SX91','BT72','6-1 4-6 6-4','R128',143,9,3,99,55,36,26,13,5,6,6,5,88,57,38,13,14,6,10);
+INSERT INTO "match" VALUES(410,6,'2025-05-05',15,'O','T0HA','O522','6-4 7-6(11)','R128',108,0,6,73,36,29,22,11,4,6,5,4,80,49,33,16,11,4,7);
+INSERT INTO "match" VALUES(411,6,'2025-05-05',16,'O','V832','MW18','7-6(2) 6-2','R128',91,6,1,64,38,29,17,10,3,4,3,0,60,46,29,9,10,5,8);
+INSERT INTO "match" VALUES(412,6,'2025-05-05',17,'O','B0FV','SU87','6-2 6-3','R128',92,0,1,58,39,25,10,8,3,4,1,4,57,33,18,9,9,3,8);
+INSERT INTO "match" VALUES(413,6,'2025-05-05',18,'O','C0DF','AE14','6-1 7-5','R128',82,7,4,60,38,29,12,10,4,6,5,2,58,31,18,8,9,4,9);
+INSERT INTO "match" VALUES(414,6,'2025-05-05',19,'O','D0FJ','Y09V','7-6(4) 6-3','R128',111,7,3,65,36,26,20,10,2,2,4,2,70,35,27,18,11,1,3);
+INSERT INTO "match" VALUES(415,6,'2025-05-05',20,'O','DB63','EA24','6-3 6-2','R128',74,1,2,41,25,21,12,8,0,0,2,2,51,32,21,7,9,3,7);
+INSERT INTO "match" VALUES(416,6,'2025-05-05',21,'O','G0FW','D923','7-6(3) 2-6 6-4','R128',147,0,0,103,77,43,15,15,6,12,0,1,85,54,36,12,15,2,7);
+INSERT INTO "match" VALUES(417,6,'2025-05-05',22,'O','GJ37','KI95','4-6 6-3 6-0','R128',94,16,1,73,54,43,8,13,2,4,3,6,71,46,28,8,12,2,7);
+INSERT INTO "match" VALUES(418,6,'2025-05-05',23,'O','KI82','HB64','6-4 6-3','R128',93,2,5,56,33,26,11,9,1,2,3,2,72,48,33,6,10,5,9);
+INSERT INTO "match" VALUES(419,6,'2025-05-05',24,'O','L987','N732','7-5 6-1','R128',80,5,1,60,41,32,8,10,2,3,1,3,55,29,19,12,9,6,10);
+INSERT INTO "match" VALUES(420,6,'2025-05-05',25,'O','MW02','H0BH','3-6 6-1 7-5','R128',153,1,6,101,62,38,23,14,9,12,1,1,87,53,32,19,14,6,11);
+INSERT INTO "match" VALUES(421,6,'2025-05-05',26,'O','MP20','L0BV','2-6 6-3 7-6(5)','R128',156,1,3,111,84,49,9,15,8,14,7,5,96,49,32,20,14,7,12);
+INSERT INTO "match" VALUES(422,6,'2025-05-05',27,'O','N771','O483','6-3 6-2','R128',76,2,1,55,31,27,14,9,3,3,5,0,48,30,16,12,8,2,5);
+INSERT INTO "match" VALUES(423,6,'2025-05-05',28,'O','P0CT','T0AP','6-0 2-6 6-3','R128',117,8,2,84,56,42,11,12,3,5,1,4,77,44,26,15,11,9,13);
+INSERT INTO "match" VALUES(424,6,'2025-05-05',29,'O','TE16','K0AZ','6-3 1-6 7-5','R128',137,5,4,80,62,41,8,14,4,8,11,8,88,59,40,14,14,4,8);
+INSERT INTO "match" VALUES(425,6,'2025-05-05',30,'O','TC61','M0GZ','3-6 6-3 7-6(5)','R128',142,5,3,80,45,36,23,15,0,2,13,2,92,58,43,19,15,3,5);
+INSERT INTO "match" VALUES(426,6,'2025-05-05',31,'O','U182','CD85','6-2 1-6 6-3','R128',126,1,3,78,55,33,13,12,0,3,1,1,75,52,31,13,12,7,11);
+INSERT INTO "match" VALUES(427,6,'2025-05-05',32,'O','V0AM','M0JF','6-4 6-4','R128',99,8,3,79,39,26,25,10,8,9,2,5,55,33,26,7,10,2,5);
+INSERT INTO "match" VALUES(428,6,'2025-05-05',33,'O','S0AG','N0BS','6-3 6-4','R64',98,1,1,63,38,24,17,10,2,3,0,1,60,45,26,8,9,4,7);
+INSERT INTO "match" VALUES(429,6,'2025-05-05',34,'O','GC88','FB98','7-6(4) 7-6(3)','R64',102,4,3,77,44,34,16,12,4,7,4,2,71,43,31,12,12,0,3);
+INSERT INTO "match" VALUES(430,6,'2025-05-05',35,'O','RH16','BK92','6-4 4-6 6-3','R64',116,7,2,78,48,37,19,15,0,2,15,5,95,63,46,12,14,5,8);
+INSERT INTO "match" VALUES(431,6,'2025-05-05',36,'O','DH58','N0BG','6-4 7-5','R64',117,5,0,58,33,29,9,11,1,3,2,3,90,53,36,13,11,12,16);
+INSERT INTO "match" VALUES(432,6,'2025-05-05',37,'O','PL56','BD06','6-1 6-4','R64',80,2,0,45,22,19,14,8,0,0,0,0,53,28,18,11,9,0,4);
+INSERT INTO "match" VALUES(433,6,'2025-05-05',38,'O','MU94','S0S1','6-2 6-1','R64',77,0,2,47,33,24,10,7,1,1,1,2,56,31,19,7,8,7,12);
+INSERT INTO "match" VALUES(434,6,'2025-05-05',39,'O','O513','TD51','6-2 6-7(2) 6-3','R64',120,6,1,88,42,35,27,15,3,4,8,2,80,46,36,19,14,3,7);
+INSERT INTO "match" VALUES(435,6,'2025-05-05',40,'O','M0CI','RE44','7-5 4-6 6-3','R64',142,8,2,104,67,48,15,16,5,9,5,1,108,58,42,21,15,13,18);
+INSERT INTO "match" VALUES(436,6,'2025-05-05',41,'O','C0AU','J551','7-6(4) 6-3','R64',117,3,2,77,51,35,18,11,3,4,7,3,78,47,33,15,10,14,16);
+INSERT INTO "match" VALUES(437,6,'2025-05-05',42,'O','M0FH','T0HA','6-4 6-4','R64',82,0,1,54,25,22,14,10,1,3,2,4,64,37,23,12,10,6,10);
+INSERT INTO "match" VALUES(438,6,'2025-05-05',43,'O','M0NI','G0GD','7-6(4) 7-5','R64',102,7,2,73,38,28,25,12,0,0,5,4,71,41,30,20,12,3,4);
+INSERT INTO "match" VALUES(439,6,'2025-05-05',44,'O','K0AH','V832','6-3 6-4','R64',87,4,0,65,39,30,17,10,7,7,5,2,65,35,24,15,9,4,6);
+INSERT INTO "match" VALUES(440,6,'2025-05-05',45,'O','D0C1','DH50','6-0 6-2','R64',66,2,1,45,30,23,5,7,3,4,1,2,47,30,13,5,7,6,12);
+INSERT INTO "match" VALUES(441,6,'2025-05-05',46,'O','BK40','F0BY','6-4 7-6(0)','R64',116,6,2,66,44,34,15,11,1,2,3,4,81,48,35,13,11,5,7);
+INSERT INTO "match" VALUES(442,6,'2025-05-05',47,'O','HB71','MO44','6-1 7-5','R64',83,7,1,50,38,31,7,10,0,1,0,4,60,44,27,6,9,2,6);
+INSERT INTO "match" VALUES(443,6,'2025-05-05',48,'O','DA31','SX91','4-6 6-3 6-4','R64',135,2,1,88,57,40,17,15,1,4,4,1,88,58,40,11,14,5,9);
+INSERT INTO "match" VALUES(444,6,'2025-05-05',49,'O','Z355','U182','6-2 6-1','R64',66,1,1,45,29,20,9,7,3,4,1,4,44,35,16,1,8,4,10);
+INSERT INTO "match" VALUES(445,6,'2025-05-05',50,'O','A0E2','L987','6-3 6-3','R64',82,3,2,51,36,26,9,9,1,2,3,1,67,41,24,12,9,6,10);
+INSERT INTO "match" VALUES(446,6,'2025-05-05',51,'O','D0CO','D0FJ','6-1 6-4','R64',78,7,0,65,46,35,8,8,7,7,2,1,53,30,18,9,9,1,5);
+INSERT INTO "match" VALUES(447,6,'2025-05-05',52,'O','M0EJ','V0AM','6-3 6-2','R64',85,1,1,53,37,30,9,9,0,0,1,1,65,38,25,10,8,6,9);
+INSERT INTO "match" VALUES(448,6,'2025-05-05',53,'O','R0DG','C0DF','3-6 6-3 6-4','R64',177,3,2,136,93,59,21,14,18,20,4,4,96,59,40,19,14,7,10);
+INSERT INTO "match" VALUES(449,6,'2025-05-05',54,'O','MM58','N771','6-4 6-2','R64',92,4,4,50,34,25,10,9,0,1,0,2,77,54,33,8,9,10,14);
+INSERT INTO "match" VALUES(450,6,'2025-05-05',55,'O','F0F1','GJ37','6-2 6-2','R64',67,2,1,45,25,19,15,8,1,1,2,1,53,33,18,10,8,3,7);
+INSERT INTO "match" VALUES(451,6,'2025-05-05',56,'O','P0CT','D875','7-5 6-3','R64',104,1,2,58,41,34,7,11,1,3,6,7,77,41,27,16,10,10,14);
+INSERT INTO "match" VALUES(452,6,'2025-05-05',57,'O','TE51','MP20','6-2 7-6(3)','R64',91,8,3,57,36,29,12,10,0,1,2,3,73,55,32,8,10,4,7);
+INSERT INTO "match" VALUES(453,6,'2025-05-05',58,'O','MW02','HH26','6-3 4-0 RET','R64',69,1,1,39,21,14,11,6,5,6,0,2,51,34,14,8,7,3,8);
+INSERT INTO "match" VALUES(454,6,'2025-05-05',59,'O','KE29','B0FV','6-4 5-7 6-1','R64',160,5,3,103,75,48,15,14,7,10,1,3,96,62,37,17,15,4,10);
+INSERT INTO "match" VALUES(455,6,'2025-05-05',60,'O','P09Z','TE16','6-1 7-6(4)','R64',100,9,1,68,45,32,15,10,2,3,0,3,59,41,27,9,9,5,8);
+INSERT INTO "match" VALUES(456,6,'2025-05-05',61,'O','G0FW','SU55','6-3 6-4','R64',107,0,2,73,57,37,10,10,6,7,4,9,66,35,22,14,9,3,6);
+INSERT INTO "match" VALUES(457,6,'2025-05-05',62,'O','N0AE','TC61','W/O','R64',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(458,6,'2025-05-05',63,'O','DB63','M0QI','6-0 6-3','R64',71,1,0,55,34,24,12,8,3,4,0,3,49,34,17,5,7,3,8);
+INSERT INTO "match" VALUES(459,6,'2025-05-05',64,'O','KI82','B0BI','3-6 6-4 6-4','R64',152,3,1,95,66,40,17,15,3,7,2,2,91,64,40,14,14,4,8);
+INSERT INTO "match" VALUES(460,6,'2025-05-05',65,'O','S0AG','D0C1','6-4 6-2','R32',93,4,1,52,33,21,13,9,2,4,1,1,58,28,15,11,9,2,7);
+INSERT INTO "match" VALUES(461,6,'2025-05-05',66,'O','RH16','BK40','7-5 2-0 RET','R32',60,4,1,35,25,22,6,7,0,0,1,1,44,30,21,6,7,2,4);
+INSERT INTO "match" VALUES(462,6,'2025-05-05',67,'O','DH58','DA31','6-4 6-4','R32',117,3,1,62,25,19,23,10,5,6,1,0,57,38,24,11,10,3,6);
+INSERT INTO "match" VALUES(463,6,'2025-05-05',68,'O','PL56','M0FH','6-3 6-7(5) 6-4','R32',143,7,0,99,57,44,22,16,2,4,3,1,86,50,34,21,15,2,6);
+INSERT INTO "match" VALUES(464,6,'2025-05-05',69,'O','C0AU','O513','6-2 6-4','R32',76,2,0,53,35,27,12,9,3,3,4,0,51,27,19,11,9,1,4);
+INSERT INTO "match" VALUES(465,6,'2025-05-05',70,'O','M0NI','M0CI','6-4 7-6(2)','R32',89,10,2,64,35,29,17,11,4,6,2,5,72,42,29,14,11,3,6);
+INSERT INTO "match" VALUES(466,6,'2025-05-05',71,'O','MU94','K0AH','6-4 6-2','R32',87,1,2,52,37,28,7,9,2,3,5,1,54,36,21,8,9,3,7);
+INSERT INTO "match" VALUES(467,6,'2025-05-05',72,'O','HB71','GC88','6-3 1-6 6-1','R32',96,12,0,70,45,36,9,12,1,4,6,0,64,38,23,14,11,7,11);
+INSERT INTO "match" VALUES(468,6,'2025-05-05',73,'O','Z355','G0FW','6-4 6-0','R32',85,0,0,45,29,22,8,8,2,4,0,0,66,44,18,9,8,6,12);
+INSERT INTO "match" VALUES(469,6,'2025-05-05',74,'O','A0E2','DB63','7-6(2) 6-2','R32',103,1,0,66,44,30,14,10,2,4,1,3,72,36,21,19,10,5,9);
+INSERT INTO "match" VALUES(470,6,'2025-05-05',75,'O','D0CO','KI82','6-4 6-3','R32',101,3,2,49,29,24,14,9,4,4,1,5,79,43,27,19,10,10,13);
+INSERT INTO "match" VALUES(471,6,'2025-05-05',76,'O','M0EJ','N0AE','6-4 6-3','R32',83,4,1,52,39,32,6,9,1,1,4,0,49,30,25,7,10,1,4);
+INSERT INTO "match" VALUES(472,6,'2025-05-05',77,'O','MW02','R0DG','7-5 5-7 7-6(4)','R32',224,4,4,113,64,50,23,18,1,4,4,8,135,58,40,41,18,10,13);
+INSERT INTO "match" VALUES(473,6,'2025-05-05',78,'O','MM58','P09Z','6-4 6-1','R32',86,4,3,62,39,29,10,9,6,7,2,0,57,32,20,11,8,2,6);
+INSERT INTO "match" VALUES(474,6,'2025-05-05',79,'O','F0F1','TE51','2-6 6-4 6-2','R32',113,3,0,73,46,29,19,13,2,4,5,4,76,46,32,14,13,0,3);
+INSERT INTO "match" VALUES(475,6,'2025-05-05',80,'O','KE29','P0CT','6-3 6-0','R32',61,1,1,40,21,17,10,7,1,2,1,2,41,23,10,4,8,0,6);
+INSERT INTO "match" VALUES(476,6,'2025-05-05',81,'O','RH16','MU94','6-3 6-4','R16',97,1,1,54,32,25,17,10,2,2,3,3,61,34,23,16,9,3,5);
+INSERT INTO "match" VALUES(477,6,'2025-05-05',82,'O','S0AG','C0AU','7-6(2) 6-3','R16',137,2,0,91,60,40,15,11,6,8,2,3,86,60,36,11,10,9,12);
+INSERT INTO "match" VALUES(478,6,'2025-05-05',83,'O','Z355','F0F1','7-6(3) 6-1','R16',105,8,0,64,47,34,7,9,5,7,1,5,75,43,27,12,10,5,10);
+INSERT INTO "match" VALUES(479,6,'2025-05-05',84,'O','A0E2','KE29','6-3 3-6 7-5','R16',148,1,2,105,69,45,15,15,5,9,3,3,88,58,40,13,15,5,10);
+INSERT INTO "match" VALUES(480,6,'2025-05-05',85,'O','D0CO','MW02','1-6 6-4 6-3','R16',140,2,2,72,45,32,15,13,1,4,2,3,79,43,29,21,13,5,8);
+INSERT INTO "match" VALUES(481,6,'2025-05-05',86,'O','PL56','DH58','7-5 6-3','R16',114,0,1,74,43,27,19,11,8,10,1,3,72,41,23,15,10,3,7);
+INSERT INTO "match" VALUES(482,6,'2025-05-05',87,'O','M0EJ','MM58','7-5 6-4','R16',99,4,0,58,35,27,16,11,2,3,2,0,58,35,25,12,11,2,5);
+INSERT INTO "match" VALUES(483,6,'2025-05-05',88,'O','HB71','M0NI','7-6(5) 4-6 7-6(5)','R16',179,19,3,130,85,62,25,17,7,8,17,6,115,63,54,27,17,3,3);
+INSERT INTO "match" VALUES(484,6,'2025-05-05',89,'O','S0AG','RH16','6-0 6-1','QF',64,1,0,33,23,18,7,6,0,0,1,2,44,23,10,4,7,3,9);
+INSERT INTO "match" VALUES(485,6,'2025-05-05',90,'O','PL56','HB71','7-6(4) 6-3','QF',118,1,1,91,53,39,17,11,5,8,6,2,71,44,31,8,10,5,9);
+INSERT INTO "match" VALUES(486,6,'2025-05-05',91,'O','M0EJ','Z355','7-6(1) 6-4','QF',135,2,0,74,37,26,22,11,4,6,3,2,73,51,30,11,11,0,3);
+INSERT INTO "match" VALUES(487,6,'2025-05-05',92,'O','A0E2','D0CO','6-4 6-4','QF',97,1,3,80,49,30,18,10,6,8,1,2,47,32,18,7,10,0,4);
+INSERT INTO "match" VALUES(488,6,'2025-05-05',93,'O','S0AG','PL56','1-6 6-0 6-3','SF',103,4,1,61,44,32,7,11,3,6,0,3,74,58,33,7,11,5,10);
+INSERT INTO "match" VALUES(489,6,'2025-05-05',94,'O','A0E2','M0EJ','6-3 7-6(4)','SF',123,1,5,72,48,32,11,10,5,8,0,1,93,67,41,7,11,9,14);
+INSERT INTO "match" VALUES(490,6,'2025-05-05',95,'O','A0E2','S0AG','7-6(5) 6-1','F',103,4,2,75,48,35,16,10,2,2,1,3,58,35,25,10,9,1,3);
+INSERT INTO "match" VALUES(491,7,'2025-07-27',1,'O','MW02','B0CD','6-2 6-1','R128',73,1,1,37,18,15,11,7,0,1,2,5,53,30,15,6,8,8,14);
+INSERT INTO "match" VALUES(492,7,'2025-07-27',2,'O','B0EJ','K0AZ','7-5 7-6(3)','R128',121,5,3,79,46,38,17,12,2,2,12,9,97,56,41,18,12,6,7);
+INSERT INTO "match" VALUES(493,7,'2025-07-27',3,'O','Y09V','KI82','7-6(4) 6-2','R128',110,11,0,68,35,30,15,10,2,3,3,6,75,39,28,12,10,11,14);
+INSERT INTO "match" VALUES(494,7,'2025-07-27',4,'O','CF59','U182','6-4 4-1 RET','R128',77,0,1,36,18,14,12,7,1,2,3,2,60,27,17,14,8,6,10);
+INSERT INTO "match" VALUES(495,7,'2025-07-27',5,'O','CD85','D0DP','2-6 6-4 6-4','R128',141,7,4,84,42,32,21,14,4,7,9,8,85,46,34,21,14,3,6);
+INSERT INTO "match" VALUES(496,7,'2025-07-27',6,'O','C0DF','D923','6-3 7-5','R128',86,11,3,55,31,28,10,11,0,2,0,6,62,42,25,9,10,3,7);
+INSERT INTO "match" VALUES(497,7,'2025-07-27',7,'O','GK06','RC91','7-6(2) 6-3','R128',96,5,2,69,44,36,14,11,2,3,11,4,67,44,32,8,10,6,8);
+INSERT INTO "match" VALUES(498,7,'2025-07-27',8,'O','G09O','B0GG','3-6 6-4 2-0 RET','R128',115,2,3,81,43,25,21,11,5,9,4,5,67,26,17,21,10,6,10);
+INSERT INTO "match" VALUES(499,7,'2025-07-27',9,'O','G0GD','CG80','4-6 6-2 7-6(2)','R128',156,8,9,94,48,39,23,15,4,8,3,3,90,52,31,21,15,7,12);
+INSERT INTO "match" VALUES(500,7,'2025-07-27',10,'O','ME82','GC88','6-4 6-4','R128',88,4,1,49,23,21,16,10,0,1,6,3,68,35,26,14,10,5,8);
+INSERT INTO "match" VALUES(501,7,'2025-07-27',11,'O','M0CI','DA31','6-2 6-2','R128',63,4,0,40,24,20,13,8,0,0,3,2,53,28,15,13,8,2,6);
+INSERT INTO "match" VALUES(502,7,'2025-07-27',12,'O','MK66','GB88','6-4 6-4','R128',85,6,1,49,31,25,14,10,0,1,6,10,74,36,26,16,10,8,11);
+INSERT INTO "match" VALUES(503,7,'2025-07-27',13,'O','MU94','M0C2','6-3 6-0','R128',70,6,0,34,22,19,9,7,0,0,0,1,53,30,12,12,8,5,10);
+INSERT INTO "match" VALUES(504,7,'2025-07-27',14,'O','O483','T0AP','6-1 6-2','R128',75,6,2,51,28,21,12,8,1,2,0,2,63,37,21,7,7,11,16);
+INSERT INTO "match" VALUES(505,7,'2025-07-27',15,'O','Q02L','N732','7-6(1) 6-2','R128',101,7,6,63,34,30,17,10,3,3,2,7,78,36,28,18,10,5,7);
+INSERT INTO "match" VALUES(506,7,'2025-07-27',16,'O','S0N0','F0FV','7-6(5) 6-4','R128',92,10,5,64,36,32,18,11,0,0,9,4,76,49,37,14,11,1,2);
+INSERT INTO "match" VALUES(507,7,'2025-07-27',17,'O','S0GD','B0PG','6-4 6-2','R128',78,1,1,60,38,24,16,9,3,3,4,2,50,33,23,8,9,1,4);
+INSERT INTO "match" VALUES(508,7,'2025-07-27',18,'O','V832','MO44','7-5 6-3','R128',111,8,2,66,35,27,13,11,2,5,1,3,76,53,27,12,10,5,10);
+INSERT INTO "match" VALUES(509,7,'2025-07-27',19,'O','WB08','AE14','3-6 6-1 6-4','R128',107,8,6,69,26,21,27,13,2,4,9,5,77,34,26,20,13,4,8);
+INSERT INTO "match" VALUES(510,7,'2025-07-27',20,'O','A0K3','R0EB','6-3 7-6(4)','R128',103,5,4,87,59,44,7,11,5,9,3,6,64,38,26,9,10,6,11);
+INSERT INTO "match" VALUES(511,7,'2025-07-27',21,'O','BF23','PD07','6-2 3-6 6-3','R128',116,11,2,68,42,31,15,13,1,4,6,5,79,35,31,13,13,4,9);
+INSERT INTO "match" VALUES(512,7,'2025-07-27',22,'O','BS86','MC65','6-4 4-6 7-6(3)','R128',166,6,3,122,77,54,22,16,10,13,7,15,97,49,40,22,16,7,10);
+INSERT INTO "match" VALUES(513,7,'2025-07-27',23,'O','D994','S0RE','6-3 7-6(3)','R128',90,6,4,66,28,26,20,11,2,4,2,3,61,34,26,9,10,2,5);
+INSERT INTO "match" VALUES(514,7,'2025-07-27',24,'O','EA24','H996','6-4 4-6 7-5','R128',138,5,2,86,53,40,20,16,4,7,12,13,94,54,43,16,16,3,7);
+INSERT INTO "match" VALUES(515,7,'2025-07-27',25,'O','FA43','F0BY','6-2 6-3','R128',70,2,0,38,27,23,9,8,0,0,1,5,64,35,20,15,9,8,12);
+INSERT INTO "match" VALUES(516,7,'2025-07-27',26,'O','KI95','HB64','4-6 6-4 7-5','R128',137,9,8,117,56,48,27,16,11,13,12,7,95,60,46,16,16,0,3);
+INSERT INTO "match" VALUES(517,7,'2025-07-27',27,'O','M0GZ','M0HU','6-4 6-2','R128',71,6,4,50,29,24,13,9,1,1,5,2,55,24,17,14,9,1,4);
+INSERT INTO "match" VALUES(518,7,'2025-07-27',28,'O','N0AM','BU13','6-1 7-6(4)','R128',86,7,4,58,35,30,15,10,2,3,3,7,70,35,21,20,9,7,10);
+INSERT INTO "match" VALUES(519,7,'2025-07-27',29,'O','O522','O513','7-6(6) 7-5','R128',115,19,10,89,40,36,26,12,7,7,10,5,80,43,36,19,12,1,2);
+INSERT INTO "match" VALUES(520,7,'2025-07-27',30,'O','SX50','BV16','4-6 6-2 7-6(9)','R128',141,7,8,95,56,42,24,15,2,4,7,11,102,53,37,27,15,3,6);
+INSERT INTO "match" VALUES(521,7,'2025-07-27',31,'O','T0HA','S0ZE','6-4 7-5','R128',91,2,6,68,31,25,22,11,4,5,7,2,69,42,29,11,11,4,7);
+INSERT INTO "match" VALUES(522,7,'2025-07-27',32,'O','W09E','BM95','4-6 6-0 6-3','R128',117,14,4,94,48,34,28,13,9,10,4,5,81,45,34,11,12,4,8);
+INSERT INTO "match" VALUES(523,7,'2025-07-27',33,'O','FB98','CF59','7-5 7-6(1)','R64',151,8,3,78,46,38,15,12,4,6,1,4,88,44,29,22,12,3,6);
+INSERT INTO "match" VALUES(524,7,'2025-07-27',34,'O','S0S1','ME82','6-2 6-3','R64',65,16,4,50,31,28,12,9,2,2,2,1,48,32,19,10,8,5,8);
+INSERT INTO "match" VALUES(525,7,'2025-07-27',35,'O','RE44','G09O','6-2 6-3','R64',86,6,6,64,35,27,13,9,4,5,1,4,54,27,20,7,8,2,6);
+INSERT INTO "match" VALUES(526,7,'2025-07-27',36,'O','TD51','WB08','1-6 7-5 7-6(5)','R64',133,10,3,94,55,41,24,15,7,9,17,3,95,45,40,30,16,2,3);
+INSERT INTO "match" VALUES(527,7,'2025-07-27',37,'O','DH58','C0DF','6-4 6-2','R64',90,2,3,53,23,19,20,9,1,1,4,7,58,34,25,6,9,3,6);
+INSERT INTO "match" VALUES(528,7,'2025-07-27',38,'O','M0NI','B0EJ','6-4 6-4','R64',89,13,2,63,33,31,15,10,7,7,1,2,64,37,26,14,10,5,7);
+INSERT INTO "match" VALUES(529,7,'2025-07-27',39,'O','C0E9','GK06','6-4 5-7 6-4','R64',148,12,9,110,55,38,27,16,7,11,7,3,88,51,35,20,16,3,8);
+INSERT INTO "match" VALUES(530,7,'2025-07-27',40,'O','F0F1','CD85','6-3 6-4','R64',88,6,2,68,46,33,12,10,5,6,0,3,63,39,26,11,9,1,4);
+INSERT INTO "match" VALUES(531,7,'2025-07-27',41,'O','L0BV','MK66','7-6(2) 6-4','R64',91,5,1,66,45,35,13,11,0,1,9,1,71,47,32,12,11,5,7);
+INSERT INTO "match" VALUES(532,7,'2025-07-27',42,'O','DH50','MW02','6-4 6-3','R64',84,4,3,63,38,28,9,9,8,10,2,5,53,30,16,10,10,1,6);
+INSERT INTO "match" VALUES(533,7,'2025-07-27',43,'O','M0CI','AG37','6-4 6-4','R64',101,4,0,64,37,29,12,10,5,7,2,5,59,33,22,11,10,1,5);
+INSERT INTO "match" VALUES(534,7,'2025-07-27',44,'O','O483','TE51','6-4 4-6 6-2','R64',121,7,5,93,46,34,24,14,6,8,10,4,76,40,29,16,14,2,6);
+INSERT INTO "match" VALUES(535,7,'2025-07-27',45,'O','N0AE','Q02L','7-6(6) 6-4','R64',112,13,0,70,45,36,16,11,2,2,10,8,92,44,35,25,11,11,12);
+INSERT INTO "match" VALUES(536,7,'2025-07-27',46,'O','D0F6','G0GD','6-3 7-6(5)','R64',106,8,5,65,43,35,12,11,2,3,5,6,91,52,36,18,10,10,12);
+INSERT INTO "match" VALUES(537,7,'2025-07-27',47,'O','SU87','Y09V','6-1 6-4','R64',79,7,5,53,28,22,15,9,1,2,1,3,42,21,14,8,8,0,4);
+INSERT INTO "match" VALUES(538,7,'2025-07-27',48,'O','V832','N771','6-3 6-7(2) 6-3','R64',127,13,0,87,48,39,29,16,3,3,14,3,94,55,46,18,14,9,11);
+INSERT INTO "match" VALUES(539,7,'2025-07-27',49,'O','Z355','W09E','7-6(6) 6-4','R64',102,7,1,61,40,37,11,11,2,3,5,6,81,48,36,16,11,4,6);
+INSERT INTO "match" VALUES(540,7,'2025-07-27',50,'O','M0EJ','D994','7-5 6-1','R64',82,2,3,55,30,27,14,10,2,2,6,4,61,30,19,16,9,6,9);
+INSERT INTO "match" VALUES(541,7,'2025-07-27',51,'O','R0DG','M0GZ','7-6(7) 6-3','R64',76,12,2,59,38,33,18,11,0,0,7,4,58,37,32,12,10,2,3);
+INSERT INTO "match" VALUES(542,7,'2025-07-27',52,'O','RH16','SX50','6-3 6-3','R64',81,7,2,61,41,30,9,9,2,3,6,3,49,31,19,8,9,1,5);
+INSERT INTO "match" VALUES(543,7,'2025-07-27',53,'O','MM58','S0GD','7-6(3) 6-4','R64',111,4,5,67,33,23,18,11,4,8,0,5,82,43,29,14,11,7,12);
+INSERT INTO "match" VALUES(544,7,'2025-07-27',54,'O','KE29','FA43','6-4 6-2','R64',87,5,7,65,43,38,5,9,7,8,3,4,59,30,19,11,9,5,9);
+INSERT INTO "match" VALUES(545,7,'2025-07-27',55,'O','C0AU','MU94','7-6(4) 4-6 6-4','R64',178,5,5,118,71,53,23,16,10,13,2,8,105,58,45,20,16,3,6);
+INSERT INTO "match" VALUES(546,7,'2025-07-27',56,'O','O522','M0FH','7-6(5) 6-7(5) 6-3','R64',140,24,4,107,66,57,23,17,3,4,12,8,106,54,42,33,16,4,6);
+INSERT INTO "match" VALUES(547,7,'2025-07-27',57,'O','P09Z','A0K3','7-6(7) 6-3','R64',94,9,3,72,41,35,20,11,1,1,9,4,67,40,33,14,10,2,3);
+INSERT INTO "match" VALUES(548,7,'2025-07-27',58,'O','T0HA','SU55','7-6(4) 7-5','R64',94,2,4,72,42,32,15,12,1,4,5,8,75,52,35,10,12,4,8);
+INSERT INTO "match" VALUES(549,7,'2025-07-27',59,'O','EA24','GJ37','6-4 7-6(4)','R64',119,12,1,78,58,40,11,11,7,9,6,6,82,47,30,17,11,6,9);
+INSERT INTO "match" VALUES(550,7,'2025-07-27',60,'O','M0QI','BS86','7-6(7) 6-3','R64',116,13,8,70,36,27,17,10,5,7,5,1,89,50,30,19,11,8,12);
+INSERT INTO "match" VALUES(551,7,'2025-07-27',61,'O','MP20','KI95','2-6 6-3 7-5','R64',127,7,4,100,63,43,17,15,8,12,2,2,72,35,28,19,14,2,6);
+INSERT INTO "match" VALUES(552,7,'2025-07-27',62,'O','BT72','BF23','5-7 7-6(3) 6-2','R64',169,15,0,111,73,55,22,16,3,4,5,1,134,92,62,21,16,11,13);
+INSERT INTO "match" VALUES(553,7,'2025-07-27',63,'O','A0FC','S0N0','6-3 3-6 6-3','R64',129,12,8,96,48,40,22,14,6,8,6,7,84,46,35,18,13,6,9);
+INSERT INTO "match" VALUES(554,7,'2025-07-27',64,'O','N0AM','A0GC','6-2 7-5','R64',87,8,5,62,39,35,8,10,1,1,4,5,66,37,25,14,10,6,9);
+INSERT INTO "match" VALUES(555,7,'2025-07-27',65,'O','FB98','D0F6','6-4 6-2','R32',75,5,0,48,26,23,15,9,1,1,4,6,63,35,24,11,9,4,7);
+INSERT INTO "match" VALUES(556,7,'2025-07-27',66,'O','S0S1','N0AE','6-7(8) 6-2 7-6(5)','R32',156,19,8,111,69,56,20,16,3,4,3,1,104,66,49,21,16,5,8);
+INSERT INTO "match" VALUES(557,7,'2025-07-27',67,'O','RE44','SU87','5-7 6-4 6-3','R32',152,6,2,86,58,51,9,15,2,4,10,5,110,65,46,21,16,6,10);
+INSERT INTO "match" VALUES(558,7,'2025-07-27',68,'O','TD51','V832','6-3 4-6 6-3','R32',110,10,3,83,45,34,22,14,2,4,4,2,100,58,40,21,14,8,12);
+INSERT INTO "match" VALUES(559,7,'2025-07-27',69,'O','DH50','M0NI','6-2 6-4','R32',76,2,1,48,25,17,17,9,2,3,7,5,57,29,18,11,9,0,4);
+INSERT INTO "match" VALUES(560,7,'2025-07-27',70,'O','C0E9','M0CI','6-2 4-6 6-3','R32',110,7,3,84,48,32,23,13,4,6,3,5,99,58,36,19,14,7,12);
+INSERT INTO "match" VALUES(561,7,'2025-07-27',71,'O','L0BV','F0F1','3-6 6-3 6-4','R32',112,12,5,88,50,42,17,14,1,2,3,1,76,54,41,13,14,3,5);
+INSERT INTO "match" VALUES(562,7,'2025-07-27',72,'O','Z355','A0FC','6-7(5) 6-3 6-2','R32',166,9,4,106,78,60,14,15,3,4,6,7,104,58,41,21,14,10,14);
+INSERT INTO "match" VALUES(563,7,'2025-07-27',73,'O','M0QI','M0EJ','3-6 7-6(4) 6-4','R32',151,5,6,109,68,54,17,15,10,12,5,4,99,59,42,25,16,7,9);
+INSERT INTO "match" VALUES(564,7,'2025-07-27',74,'O','R0DG','MP20','6-2 6-4','R32',65,4,1,49,32,26,11,9,0,0,2,2,46,25,19,10,9,0,3);
+INSERT INTO "match" VALUES(565,7,'2025-07-27',75,'O','RH16','BT72','7-5 6-4','R32',102,9,1,80,55,38,13,11,4,5,1,6,69,29,18,22,11,5,8);
+INSERT INTO "match" VALUES(566,7,'2025-07-27',76,'O','P09Z','MM58','5-7 6-4 6-4','R32',150,7,7,103,63,53,16,16,9,11,12,8,110,58,44,25,16,9,12);
+INSERT INTO "match" VALUES(567,7,'2025-07-27',77,'O','KE29','N0AM','6-7(6) 6-4 6-1','R32',130,8,3,82,48,34,24,14,0,1,10,8,103,57,44,16,15,6,11);
+INSERT INTO "match" VALUES(568,7,'2025-07-27',78,'O','C0AU','EA24','6-3 6-4','R32',109,1,1,71,36,23,22,10,8,9,5,0,64,37,26,11,9,7,10);
+INSERT INTO "match" VALUES(569,7,'2025-07-27',79,'O','DH58','O483','W/O','R32',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(570,7,'2025-07-27',80,'O','T0HA','O522','7-6(3) 6-3','R32',85,2,2,82,50,40,18,11,4,4,10,5,57,31,30,12,10,0,1);
+INSERT INTO "match" VALUES(571,7,'2025-07-27',81,'O','FB98','L0BV','7-6(4) 6-7(5) 7-6(5)','R16',176,16,5,133,79,65,31,18,9,9,6,2,125,78,63,28,18,5,5);
+INSERT INTO "match" VALUES(572,7,'2025-07-27',82,'O','S0S1','C0E9','6-4 4-6 7-6(1)','R16',144,12,4,112,69,49,21,16,7,10,8,2,101,45,34,29,16,6,9);
+INSERT INTO "match" VALUES(573,7,'2025-07-27',83,'O','RE44','DH50','6-7(3) 7-6(2) 3-0 RET','R16',141,12,2,90,52,47,22,14,3,3,8,2,107,74,50,19,13,5,6);
+INSERT INTO "match" VALUES(574,7,'2025-07-27',84,'O','DH58','TD51','6-2 4-6 6-4','R16',144,6,5,92,39,30,26,14,4,7,10,4,90,43,32,20,14,5,10);
+INSERT INTO "match" VALUES(575,7,'2025-07-27',85,'O','Z355','C0AU','6-4 1-0 RET','R16',51,3,1,29,21,16,3,5,1,2,1,3,35,29,15,2,6,1,4);
+INSERT INTO "match" VALUES(576,7,'2025-07-27',86,'O','P09Z','R0DG','4-6 6-2 6-3','R16',123,14,4,77,45,39,18,14,3,4,7,5,97,63,41,17,13,11,14);
+INSERT INTO "match" VALUES(577,7,'2025-07-27',87,'O','KE29','RH16','6-4 7-5','R16',93,7,3,54,30,29,13,11,3,4,9,2,72,49,28,15,11,9,12);
+INSERT INTO "match" VALUES(578,7,'2025-07-27',88,'O','M0QI','T0HA','6-3 6-3','R16',80,3,2,65,36,26,16,9,3,4,2,8,66,35,21,14,9,6,10);
+INSERT INTO "match" VALUES(579,7,'2025-07-27',89,'O','FB98','RE44','6-3 7-6(4)','QF',81,20,3,73,48,38,16,11,3,4,6,1,57,31,24,15,10,0,2);
+INSERT INTO "match" VALUES(580,7,'2025-07-27',90,'O','S0S1','DH58','6-3 6-4','QF',91,11,1,60,37,29,12,10,1,2,1,2,66,35,23,15,9,2,5);
+INSERT INTO "match" VALUES(581,7,'2025-07-27',91,'O','Z355','P09Z','6-7(8) 6-4 6-3','QF',162,12,7,100,68,56,16,16,2,3,11,5,103,63,47,18,15,3,6);
+INSERT INTO "match" VALUES(582,7,'2025-07-27',92,'O','KE29','M0QI','6-4 7-6(3)','QF',104,6,5,73,47,40,13,11,6,7,5,3,88,55,37,17,11,9,11);
+INSERT INTO "match" VALUES(583,7,'2025-07-27',93,'O','KE29','Z355','6-3 4-6 7-6(4)','SF',172,5,3,105,63,46,22,16,1,2,13,7,102,72,52,13,15,2,3);
+INSERT INTO "match" VALUES(584,7,'2025-07-27',94,'O','S0S1','FB98','6-4 6-3','SF',78,7,0,51,29,25,13,9,2,2,4,3,61,38,26,9,10,7,10);
+INSERT INTO "match" VALUES(585,7,'2025-07-27',95,'O','S0S1','KE29','6-7(5) 6-4 7-6(3)','F',167,16,6,108,69,55,23,17,5,6,3,2,101,64,46,26,17,4,6);
+INSERT INTO "match" VALUES(586,8,'2025-08-07',1,'O','B0NN','V832','7-6(5) 7-5','R128',100,10,4,74,47,30,19,12,1,3,13,2,82,42,32,18,12,3,6);
+INSERT INTO "match" VALUES(587,8,'2025-08-07',2,'O','BD06','AE14','7-6(5) 7-6(1)','R128',119,5,5,76,50,40,13,12,1,3,13,4,87,53,40,15,12,5,7);
+INSERT INTO "match" VALUES(588,8,'2025-08-07',3,'O','B0PG','GC88','6-2 3-6 6-3','R128',111,8,2,72,47,37,15,13,0,1,1,1,82,43,29,21,13,4,7);
+INSERT INTO "match" VALUES(589,8,'2025-08-07',4,'O','B0EJ','H09P','6-3 7-6(3)','R128',110,8,0,70,48,37,11,11,3,4,5,1,80,50,32,16,10,7,9);
+INSERT INTO "match" VALUES(590,8,'2025-08-07',5,'O','B0CD','MP20','7-6(2) 5-7 6-1','R128',159,7,3,111,63,44,27,16,8,11,7,9,95,57,39,18,15,5,9);
+INSERT INTO "match" VALUES(591,8,'2025-08-07',6,'O','C0DF','MU94','6-4 6-4','R128',105,6,2,68,36,29,15,10,9,10,2,0,56,38,25,10,10,2,5);
+INSERT INTO "match" VALUES(592,8,'2025-08-07',7,'O','D923','B0GG','7-6(7) 7-6(5)','R128',143,1,4,102,69,48,15,12,8,11,5,6,100,66,44,13,12,4,7);
+INSERT INTO "match" VALUES(593,8,'2025-08-07',8,'O','L0IL','K0A3','3-6 6-3 6-2','R128',140,8,5,82,47,39,18,13,4,6,10,5,90,56,39,14,13,5,9);
+INSERT INTO "match" VALUES(594,8,'2025-08-07',9,'O','M0JF','K0AZ','6-2 6-3','R128',62,15,0,35,22,20,12,8,0,0,4,5,54,27,20,9,9,1,5);
+INSERT INTO "match" VALUES(595,8,'2025-08-07',10,'O','N0BG','T0A1','6-4 7-6(5)','R128',117,4,6,72,46,32,15,11,2,5,5,8,75,32,23,20,11,6,10);
+INSERT INTO "match" VALUES(596,8,'2025-08-07',11,'O','N0AM','CG80','6-3 7-5','R128',98,10,0,54,38,30,14,11,0,0,5,5,72,32,23,20,10,6,8);
+INSERT INTO "match" VALUES(597,8,'2025-08-07',12,'O','O522','DA31','7-5 7-6(3)','R128',100,15,2,72,35,27,29,12,5,5,2,3,74,52,38,12,12,2,3);
+INSERT INTO "match" VALUES(598,8,'2025-08-07',13,'O','Q02L','KI95','7-6(5) 6-4','R128',98,7,5,65,33,30,15,11,3,5,3,3,75,42,27,19,11,1,4);
+INSERT INTO "match" VALUES(599,8,'2025-08-07',14,'O','R0EB','O513','5-7 6-3 6-3','R128',105,9,1,81,50,40,20,15,2,3,16,9,90,40,34,25,15,6,9);
+INSERT INTO "match" VALUES(600,8,'2025-08-07',15,'O','T0HA','R0FS','6-3 6-4','R128',78,5,5,67,43,34,13,10,6,6,7,3,52,25,21,14,9,4,6);
+INSERT INTO "match" VALUES(601,8,'2025-08-07',16,'O','U182','N552','7-5 6-3','R128',97,4,3,67,37,30,15,11,2,3,2,4,73,44,28,13,10,5,8);
+INSERT INTO "match" VALUES(602,8,'2025-08-07',17,'O','W09E','N0BS','4-6 7-6(3) 6-1','R128',159,1,4,96,46,34,28,14,6,9,7,9,106,51,34,25,15,6,11);
+INSERT INTO "match" VALUES(603,8,'2025-08-07',18,'O','A0GC','N732','6-2 6-2','R128',80,7,2,44,28,23,8,8,2,3,2,5,81,51,29,9,8,14,19);
+INSERT INTO "match" VALUES(604,8,'2025-08-07',19,'O','B0BI','GB88','6-1 6-3','R128',76,2,2,59,37,29,12,8,4,4,3,3,61,35,19,12,8,4,8);
+INSERT INTO "match" VALUES(605,8,'2025-08-07',20,'O','BU13','F0BY','6-1 6-4','R128',80,8,6,56,29,25,12,9,1,2,2,6,51,31,20,6,8,5,9);
+INSERT INTO "match" VALUES(606,8,'2025-08-07',21,'O','BM95','A0FC','6-7(1) 6-3 6-4','R128',177,5,2,128,72,53,31,16,10,10,4,6,95,48,35,28,15,4,6);
+INSERT INTO "match" VALUES(607,8,'2025-08-07',22,'O','CF59','G09O','6-4 5-7 6-3','R128',154,1,4,100,57,41,24,16,6,9,3,2,79,52,36,14,15,2,6);
+INSERT INTO "match" VALUES(608,8,'2025-08-07',23,'O','EA24','S0RE','6-7(5) 7-6(4) 6-4','R128',219,16,2,120,66,47,32,17,5,7,5,3,114,73,56,18,17,3,6);
+INSERT INTO "match" VALUES(609,8,'2025-08-07',24,'O','F0FV','Y09V','4-6 6-2 7-5','R128',139,13,5,86,59,45,14,15,3,5,8,4,93,39,29,25,15,4,8);
+INSERT INTO "match" VALUES(610,8,'2025-08-07',25,'O','GE33','KI82','6-2 6-4','R128',99,6,5,64,34,27,12,9,4,6,1,6,67,35,18,14,9,6,11);
+INSERT INTO "match" VALUES(611,8,'2025-08-07',26,'O','ME82','TC61','6-2 6-2','R128',88,5,1,45,27,23,11,8,1,1,4,1,68,36,21,13,8,4,8);
+INSERT INTO "match" VALUES(612,8,'2025-08-07',27,'O','M0CI','S0ZE','6-1 4-6 6-4','R128',132,4,5,94,60,46,16,14,6,7,3,7,95,57,42,15,13,8,11);
+INSERT INTO "match" VALUES(613,8,'2025-08-07',28,'O','MO44','J551','1-6 6-4 6-3','R128',152,3,6,94,56,34,21,13,7,10,15,5,73,47,35,13,13,3,6);
+INSERT INTO "match" VALUES(614,8,'2025-08-07',29,'O','MW02','MK66','7-5 6-3','R128',91,8,4,70,39,28,17,11,5,7,3,0,52,35,21,10,10,1,5);
+INSERT INTO "match" VALUES(615,8,'2025-08-07',30,'O','RC91','BT72','6-3 6-3','R128',84,6,3,55,33,28,12,9,2,2,2,4,58,33,22,14,9,2,5);
+INSERT INTO "match" VALUES(616,8,'2025-08-07',31,'O','SX50','TE30','6-3 6-3','R128',68,11,3,47,29,25,12,9,0,0,6,1,50,30,23,9,9,2,5);
+INSERT INTO "match" VALUES(617,8,'2025-08-07',32,'O','W0BH','M0GZ','6-3 6-2','R128',55,6,1,46,34,28,8,9,0,0,7,5,42,22,20,6,8,4,7);
+INSERT INTO "match" VALUES(618,8,'2025-08-07',33,'O','A0E2','D923','6-1 2-6 6-3','R64',101,7,6,73,44,30,15,12,0,3,2,1,83,58,32,13,12,5,10);
+INSERT INTO "match" VALUES(619,8,'2025-08-07',34,'O','Z355','B0NN','6-3 6-3','R64',66,12,1,50,41,32,4,9,0,0,1,4,51,26,18,12,9,0,3);
+INSERT INTO "match" VALUES(620,8,'2025-08-07',35,'O','S0S1','U182','6-3 3-1 RET','R64',63,4,3,44,31,26,6,7,1,1,0,3,38,19,15,8,6,3,5);
+INSERT INTO "match" VALUES(621,8,'2025-08-07',36,'O','O522','DH58','7-6(6) 6-4','R64',99,14,5,76,41,31,24,11,7,7,2,0,69,49,37,12,11,0,1);
+INSERT INTO "match" VALUES(622,8,'2025-08-07',37,'O','RE44','T0HA','7-6(4) 6-3','R64',104,12,0,67,40,34,15,11,3,4,4,8,74,37,27,17,10,4,6);
+INSERT INTO "match" VALUES(623,8,'2025-08-07',38,'O','W09E','MM58','6-7(0) 6-4 6-1','R64',141,5,2,106,65,50,18,15,5,6,18,7,81,48,40,11,14,2,6);
+INSERT INTO "match" VALUES(624,8,'2025-08-07',39,'O','KE29','R0EB','6-4 7-6(6)','R64',110,7,0,63,41,30,13,11,1,3,6,2,92,60,41,12,11,8,11);
+INSERT INTO "match" VALUES(625,8,'2025-08-07',40,'O','M0NI','Q02L','6-4 6-2','R64',72,10,1,58,28,23,17,9,0,0,2,4,50,26,18,11,9,0,3);
+INSERT INTO "match" VALUES(626,8,'2025-08-07',41,'O','P09Z','L0IL','7-6(3) 6-3','R64',137,15,7,99,51,37,25,11,13,14,7,7,67,43,31,9,10,5,7);
+INSERT INTO "match" VALUES(627,8,'2025-08-07',42,'O','L0BV','B0EJ','4-6 6-1 6-4','R64',113,9,5,71,46,40,14,14,2,3,4,1,77,48,36,13,13,0,3);
+INSERT INTO "match" VALUES(628,8,'2025-08-07',43,'O','N0BG','SU55','6-7(5) 6-3 6-4','R64',148,3,3,101,64,48,21,16,5,6,4,8,103,69,48,16,15,7,10);
+INSERT INTO "match" VALUES(629,8,'2025-08-07',44,'O','M0JF','GJ37','6-4 7-6(3)','R64',100,14,3,72,43,36,17,11,5,6,13,7,72,44,36,11,11,5,7);
+INSERT INTO "match" VALUES(630,8,'2025-08-07',45,'O','N0AE','B0PG','4-6 6-3 7-6(5)','R64',143,6,3,107,73,50,20,16,11,15,7,3,100,61,43,20,15,12,16);
+INSERT INTO "match" VALUES(631,8,'2025-08-07',46,'O','C0DF','D0FJ','6-4 3-1 RET','R64',52,14,2,33,22,22,6,7,0,0,3,10,43,12,9,15,7,0,2);
+INSERT INTO "match" VALUES(632,8,'2025-08-07',47,'O','BD06','N771','6-4 6-3','R64',111,9,2,74,50,39,9,10,6,7,6,6,64,38,28,10,9,8,11);
+INSERT INTO "match" VALUES(633,8,'2025-08-07',48,'O','B0CD','C0H0','7-5 6-1','R64',113,3,1,65,42,34,13,10,6,6,5,3,81,42,33,13,9,6,9);
+INSERT INTO "match" VALUES(634,8,'2025-08-07',49,'O','S0AG','GE33','6-1 6-1','R64',59,6,3,36,23,22,8,7,1,1,5,2,48,26,13,8,7,8,13);
+INSERT INTO "match" VALUES(635,8,'2025-08-07',50,'O','FB98','N0AM','6-4 6-4','R64',68,12,0,53,32,26,16,10,2,2,9,2,50,32,25,9,10,1,3);
+INSERT INTO "match" VALUES(636,8,'2025-08-07',51,'O','R0DG','SX50','7-5 7-6(5)','R64',118,4,4,84,47,32,23,12,2,4,2,4,70,38,24,21,12,2,5);
+INSERT INTO "match" VALUES(637,8,'2025-08-07',52,'O','BM95','M0EJ','5-7 6-4 7-6(4)','R64',166,10,4,110,65,43,22,17,9,14,11,5,110,67,46,21,17,3,8);
+INSERT INTO "match" VALUES(638,8,'2025-08-07',53,'O','TD51','CF59','6-4 6-3','R64',90,7,3,54,24,18,14,9,1,4,10,4,74,39,25,12,10,11,17);
+INSERT INTO "match" VALUES(639,8,'2025-08-07',54,'O','RC91','RH16','6-7(5) 6-4 6-2','R64',157,13,6,95,63,49,18,15,8,9,8,3,88,49,35,20,15,0,4);
+INSERT INTO "match" VALUES(640,8,'2025-08-07',55,'O','PL56','MO44','6-2 6-2','R64',91,8,2,56,33,25,13,8,6,6,0,4,65,37,19,13,8,6,10);
+INSERT INTO "match" VALUES(641,8,'2025-08-07',56,'O','A0GC','C0E9','6-4 3-6 7-6(5)','R64',134,9,5,106,61,46,22,15,8,10,7,6,94,49,40,27,16,3,5);
+INSERT INTO "match" VALUES(642,8,'2025-08-07',57,'O','F0FV','DH50','6-7(4) 5-4 RET','R64',98,7,3,65,42,28,11,10,2,6,7,4,68,32,23,18,11,2,7);
+INSERT INTO "match" VALUES(643,8,'2025-08-07',58,'O','ME82','M0FH','6-3 6-3','R64',90,5,0,59,29,24,16,9,3,4,7,7,75,41,21,16,9,7,11);
+INSERT INTO "match" VALUES(644,8,'2025-08-07',59,'O','HH26','W0BH','6-3 6-4','R64',67,10,1,57,37,32,10,10,1,1,6,1,45,32,25,7,9,2,4);
+INSERT INTO "match" VALUES(645,8,'2025-08-07',60,'O','AG37','EA24','6-2 7-6(3)','R64',117,14,1,67,53,41,8,10,4,4,2,2,66,35,25,14,10,2,4);
+INSERT INTO "match" VALUES(646,8,'2025-08-07',61,'O','TE51','M0CI','7-6(3) 6-2','R64',83,9,0,63,44,33,12,10,3,3,2,5,65,38,29,11,10,1,3);
+INSERT INTO "match" VALUES(647,8,'2025-08-07',62,'O','M0QI','MW02','3-6 6-3 6-4','R64',146,2,4,87,46,37,18,14,3,6,8,4,92,55,36,17,14,9,13);
+INSERT INTO "match" VALUES(648,8,'2025-08-07',63,'O','D0F6','B0BI','7-5 6-4','R64',91,9,3,56,32,27,12,11,0,2,0,5,67,44,29,10,11,3,7);
+INSERT INTO "match" VALUES(649,8,'2025-08-07',64,'O','SU87','BU13','6-3 7-6(4)','R64',101,5,2,66,43,36,13,11,1,1,5,5,64,31,23,19,10,3,4);
+INSERT INTO "match" VALUES(650,8,'2025-08-07',65,'O','A0E2','M0JF','6-4 6-4','R32',95,12,3,57,33,26,15,10,1,2,9,8,79,47,30,16,10,4,7);
+INSERT INTO "match" VALUES(651,8,'2025-08-07',66,'O','Z355','N0AE','6-4 6-4','R32',96,12,2,61,44,33,10,10,4,4,3,0,59,31,23,14,10,2,4);
+INSERT INTO "match" VALUES(652,8,'2025-08-07',67,'O','RE44','P09Z','6-7(5) 7-6(5) 7-5','R32',209,18,9,124,69,54,33,18,5,6,20,5,127,77,57,25,18,6,8);
+INSERT INTO "match" VALUES(653,8,'2025-08-07',68,'O','KE29','B0CD','6-3 6-3','R32',84,2,0,58,32,23,16,9,2,3,1,1,52,34,21,7,9,3,7);
+INSERT INTO "match" VALUES(654,8,'2025-08-07',69,'O','N0BG','M0NI','6-2 2-1 RET','R32',42,3,1,31,16,12,11,5,2,2,5,6,32,18,12,4,6,3,6);
+INSERT INTO "match" VALUES(655,8,'2025-08-07',70,'O','L0BV','W09E','7-6(5) 7-6(3)','R32',114,17,3,71,40,36,19,12,0,1,5,2,81,49,36,19,12,1,2);
+INSERT INTO "match" VALUES(656,8,'2025-08-07',71,'O','C0DF','O522','6-7(4) 6-4 7-5','R32',188,15,6,103,59,45,25,17,3,5,27,10,123,67,57,19,17,9,13);
+INSERT INTO "match" VALUES(657,8,'2025-08-07',72,'O','S0AG','D0F6','6-2 7-6(6)','R32',112,6,5,62,31,25,20,10,2,3,10,10,84,52,40,5,10,9,12);
+INSERT INTO "match" VALUES(658,8,'2025-08-07',73,'O','FB98','SU87','7-6(4) 7-5','R32',127,13,2,66,37,32,21,12,0,0,4,6,83,45,35,21,12,4,5);
+INSERT INTO "match" VALUES(659,8,'2025-08-07',74,'O','R0DG','M0QI','7-6(4) 6-3','R32',93,9,4,67,39,32,14,11,0,1,3,3,62,39,28,12,10,4,6);
+INSERT INTO "match" VALUES(660,8,'2025-08-07',75,'O','TD51','HH26','6-4 6-4','R32',83,8,1,59,41,31,8,10,1,2,8,1,66,37,24,14,10,9,12);
+INSERT INTO "match" VALUES(661,8,'2025-08-07',76,'O','ME82','PL56','5-7 6-3 6-4','R32',159,5,3,108,59,47,23,16,6,8,8,4,95,48,40,22,15,5,8);
+INSERT INTO "match" VALUES(662,8,'2025-08-07',77,'O','AG37','RC91','7-6(4) 4-2 RET','R32',121,7,3,50,30,26,13,9,0,1,10,6,81,52,35,13,9,9,11);
+INSERT INTO "match" VALUES(663,8,'2025-08-07',78,'O','BM95','TE51','6-7(4) 6-3 6-4','R32',159,6,6,103,59,49,21,16,5,6,14,3,108,57,43,25,15,8,11);
+INSERT INTO "match" VALUES(664,8,'2025-08-07',79,'O','A0GC','F0FV','6-3 6-4','R32',78,8,3,60,34,27,15,10,1,2,1,0,64,45,28,9,9,10,13);
+INSERT INTO "match" VALUES(665,8,'2025-08-07',80,'O','S0S1','BD06','7-6(3) 6-3','R32',109,15,2,78,41,30,22,10,8,8,5,3,60,46,36,4,11,0,2);
+INSERT INTO "match" VALUES(666,8,'2025-08-07',81,'O','S0AG','ME82','6-4 7-6(4)','R16',108,12,2,62,32,31,17,11,0,1,10,3,83,48,35,17,11,7,9);
+INSERT INTO "match" VALUES(667,8,'2025-08-07',82,'O','A0E2','N0BG','6-1 6-4','R16',80,2,3,46,30,25,9,9,1,2,0,8,66,38,24,11,8,7,11);
+INSERT INTO "match" VALUES(668,8,'2025-08-07',83,'O','Z355','KE29','7-5 3-0 RET','R16',70,5,1,34,25,20,4,7,0,1,1,0,54,32,22,5,8,4,8);
+INSERT INTO "match" VALUES(669,8,'2025-08-07',84,'O','A0GC','FB98','3-6 7-5 6-3','R16',119,13,5,83,49,40,17,15,3,5,7,2,92,60,46,14,15,3,6);
+INSERT INTO "match" VALUES(670,8,'2025-08-07',85,'O','R0DG','TD51','6-4 3-1 RET','R16',72,5,4,40,21,19,9,7,1,2,2,1,48,18,10,14,7,2,5);
+INSERT INTO "match" VALUES(671,8,'2025-08-07',86,'O','RE44','C0DF','6-2 6-3','R16',64,8,2,47,32,26,6,8,1,2,11,5,52,28,19,6,9,3,8);
+INSERT INTO "match" VALUES(672,8,'2025-08-07',87,'O','AG37','BM95','6-4 6-3','R16',74,9,3,51,35,31,7,10,1,2,2,1,48,24,15,12,9,0,3);
+INSERT INTO "match" VALUES(673,8,'2025-08-07',88,'O','S0S1','L0BV','6-4 6-4','R16',81,8,2,51,32,26,12,10,0,1,6,4,63,30,21,16,10,5,8);
+INSERT INTO "match" VALUES(674,8,'2025-08-07',89,'O','S0AG','AG37','6-0 6-2','QF',71,2,2,39,23,18,10,7,0,1,0,8,45,25,12,4,7,4,10);
+INSERT INTO "match" VALUES(675,8,'2025-08-07',90,'O','A0GC','R0DG','6-2 6-3','QF',73,7,3,53,33,28,8,9,1,2,4,1,57,33,20,10,8,7,11);
+INSERT INTO "match" VALUES(676,8,'2025-08-07',91,'O','A0E2','RE44','6-3 4-6 7-5','QF',137,11,4,86,53,40,17,15,0,2,11,8,95,59,43,17,16,2,6);
+INSERT INTO "match" VALUES(677,8,'2025-08-07',92,'O','Z355','S0S1','6-2 6-2','QF',77,5,2,49,32,26,9,8,1,1,12,2,58,39,26,4,8,7,11);
+INSERT INTO "match" VALUES(678,8,'2025-08-07',93,'O','S0AG','A0GC','7-6(4) 6-2','SF',86,6,0,60,35,32,17,10,0,0,9,1,58,40,31,8,10,3,5);
+INSERT INTO "match" VALUES(679,8,'2025-08-07',94,'O','A0E2','Z355','6-4 6-3','SF',105,11,4,51,27,22,15,9,4,5,3,1,61,46,25,7,10,2,6);
+INSERT INTO "match" VALUES(680,8,'2025-08-07',95,'O','A0E2','S0AG','5-0 RET','F',23,1,0,13,6,5,4,2,0,0,1,2,16,8,4,0,3,3,6);
+INSERT INTO "match" VALUES(681,9,'2025-09-24',1,'O','B0BI','Z371','2-6 6-3 6-4','R128',120,7,4,88,58,40,12,14,8,12,9,0,84,55,35,16,13,8,12);
+INSERT INTO "match" VALUES(682,9,'2025-09-24',2,'O','AE14','S0N0','6-3 6-4','R128',82,8,0,48,28,25,15,10,0,0,8,0,59,46,33,3,9,4,6);
+INSERT INTO "match" VALUES(683,9,'2025-09-24',3,'O','B0GG','W09E','7-6(6) 6-1','R128',83,9,2,58,37,30,15,10,0,0,3,1,54,39,29,8,9,0,2);
+INSERT INTO "match" VALUES(684,9,'2025-09-24',4,'O','BU13','K0AH','6-4 7-5','R128',97,7,3,63,41,31,11,11,0,2,3,4,68,43,27,11,11,6,10);
+INSERT INTO "match" VALUES(685,9,'2025-09-24',5,'O','C977','BG23','6-3 7-6(5)','R128',89,17,0,63,37,33,16,11,2,2,8,3,63,40,32,11,10,0,1);
+INSERT INTO "match" VALUES(686,9,'2025-09-24',6,'O','GB88','MP20','6-7(6) 6-1 6-1','R128',126,12,1,84,49,37,21,13,2,3,3,5,82,51,34,12,13,4,10);
+INSERT INTO "match" VALUES(687,9,'2025-09-24',7,'O','ME82','BK40','7-5 7-6(5)','R128',112,6,1,62,37,34,19,12,0,0,10,3,77,52,39,14,12,5,6);
+INSERT INTO "match" VALUES(688,9,'2025-09-24',8,'O','MU94','F724','4-6 7-5 6-1','R128',161,4,1,93,65,48,18,15,7,8,0,4,85,49,35,19,14,4,7);
+INSERT INTO "match" VALUES(689,9,'2025-09-24',9,'O','N0BG','O513','3-6 6-3 6-2','R128',107,5,5,81,49,38,18,13,7,8,7,2,78,44,32,20,13,6,9);
+INSERT INTO "match" VALUES(690,9,'2025-09-24',10,'O','N732','S0H2','6-1 6-2','R128',70,2,0,65,47,32,10,8,5,5,9,1,46,30,21,2,7,4,8);
+INSERT INTO "match" VALUES(691,9,'2025-09-24',11,'O','TC61','H09N','4-6 6-3 6-4','R128',128,10,1,89,54,43,20,15,4,5,8,4,78,47,38,15,14,2,4);
+INSERT INTO "match" VALUES(692,9,'2025-09-24',12,'O','VA25','DB63','6-3 6-4','R128',84,4,2,55,31,26,14,10,0,0,4,0,61,43,31,6,9,2,4);
+INSERT INTO "match" VALUES(693,9,'2025-09-24',13,'O','M0CI','W367','6-1 4-6 6-4','R128',106,3,4,80,47,39,16,14,7,9,3,1,75,40,28,19,13,6,10);
+INSERT INTO "match" VALUES(694,9,'2025-09-24',14,'O','H997','SU87','2-6 6-3 6-1','R128',115,2,2,71,50,32,15,12,3,5,8,3,66,37,26,13,12,3,7);
+INSERT INTO "match" VALUES(695,9,'2025-09-24',15,'O','S0RE','K0AZ','6-4 3-6 6-3','R128',115,6,1,77,56,40,14,14,0,1,10,1,84,54,42,14,14,1,3);
+INSERT INTO "match" VALUES(696,9,'2025-09-24',16,'O','BM95','O522','7-6(2) 6-4','R128',95,4,1,65,42,33,16,11,1,2,11,0,71,44,33,12,11,8,10);
+INSERT INTO "match" VALUES(697,9,'2025-09-24',17,'O','BT72','V812','7-6(5) 7-6(5)','R128',136,8,3,90,55,39,19,12,2,3,10,4,80,50,40,16,12,1,2);
+INSERT INTO "match" VALUES(698,9,'2025-09-24',18,'O','B0CD','T0BW','7-6(2) 6-1','R128',100,6,0,54,38,32,12,10,0,0,4,0,68,39,29,12,9,2,4);
+INSERT INTO "match" VALUES(699,9,'2025-09-24',19,'O','C0H0','MO44','6-3 3-6 7-5','R128',181,23,1,78,50,43,14,15,2,4,2,3,114,79,52,16,15,8,11);
+INSERT INTO "match" VALUES(700,9,'2025-09-24',20,'O','C0DF','BV16','6-4 6-2','R128',91,3,4,56,31,29,10,9,3,4,4,0,55,34,20,10,9,1,5);
+INSERT INTO "match" VALUES(701,9,'2025-09-24',21,'O','D0C1','Z0CQ','6-7(1) 6-2 7-6(3)','R128',164,11,4,104,68,54,18,16,1,2,17,0,97,67,55,11,16,3,6);
+INSERT INTO "match" VALUES(702,9,'2025-09-24',22,'O','HB64','MK66','6-3 6-2','R128',63,7,2,51,31,23,15,9,3,3,1,0,46,33,20,8,8,2,5);
+INSERT INTO "match" VALUES(703,9,'2025-09-24',23,'O','MQ75','Q02L','6-3 6-4','R128',66,2,0,47,27,22,18,10,0,0,8,3,51,30,23,10,9,4,6);
+INSERT INTO "match" VALUES(704,9,'2025-09-24',24,'O','O483','D923','6-2 6-4','R128',97,6,0,70,39,29,18,9,4,4,1,2,62,39,20,15,9,4,7);
+INSERT INTO "match" VALUES(705,9,'2025-09-24',25,'O','R0EB','N0BS','3-6 6-4 6-4','R128',137,8,1,91,65,44,14,15,3,7,8,3,82,49,33,15,14,1,5);
+INSERT INTO "match" VALUES(706,9,'2025-09-24',26,'O','S0GD','WB32','7-5 RET','R128',55,0,1,31,23,16,4,6,2,4,1,0,40,28,12,8,6,5,8);
+INSERT INTO "match" VALUES(707,9,'2025-09-24',27,'O','TE30','GC88','6-4 6-3','R128',77,6,1,58,42,34,9,10,2,2,3,1,50,32,20,12,9,4,6);
+INSERT INTO "match" VALUES(708,9,'2025-09-24',28,'O','U182','A0GC','4-4 RET','R128',38,4,2,27,17,12,3,4,1,2,1,1,26,17,12,4,4,2,3);
+INSERT INTO "match" VALUES(709,9,'2025-09-24',29,'O','T0HA','KI95','4-6 6-3 6-4','R128',126,11,4,84,50,40,19,15,5,7,5,2,95,70,47,11,14,6,9);
+INSERT INTO "match" VALUES(710,9,'2025-09-24',30,'O','A0FC','S0UV','7-6(3) 6-4','R128',111,6,2,66,45,35,9,11,1,3,3,2,72,39,27,18,11,7,10);
+INSERT INTO "match" VALUES(711,9,'2025-09-24',31,'O','Y09V','C0C8','6-3 6-7(5) 6-3','R128',172,10,1,117,82,63,16,16,9,9,10,4,97,58,46,19,14,3,5);
+INSERT INTO "match" VALUES(712,9,'2025-09-24',32,'O','RC91','M0JF','6-7(3) 1-0 RET','R128',104,14,0,46,35,27,3,7,3,4,6,2,68,44,31,9,6,6,7);
+INSERT INTO "match" VALUES(713,9,'2025-09-24',33,'O','VA25','BK92','3-6 6-3 6-4','R64',109,11,4,83,61,49,10,14,3,4,10,1,80,49,39,17,14,4,6);
+INSERT INTO "match" VALUES(714,9,'2025-09-24',34,'O','D643','C977','7-6(2) 6-4','R64',114,10,2,73,50,42,13,11,4,4,6,0,56,34,27,14,11,0,1);
+INSERT INTO "match" VALUES(715,9,'2025-09-24',35,'O','GB88','S0S1','6-2 6-4','R64',91,2,0,52,39,32,7,9,3,3,6,0,43,30,20,7,9,2,5);
+INSERT INTO "match" VALUES(716,9,'2025-09-24',36,'O','R0DG','B0BI','7-5 6-4','R64',106,3,5,68,42,32,9,11,3,6,1,0,71,51,28,10,11,8,13);
+INSERT INTO "match" VALUES(717,9,'2025-09-24',37,'O','C0AU','ME82','7-6(3) 7-6(4)','R64',143,9,1,82,58,45,11,12,4,6,6,1,89,52,36,20,12,2,4);
+INSERT INTO "match" VALUES(718,9,'2025-09-24',38,'O','M0FH','B0GG','6-3 6-4','R64',108,11,1,70,48,34,13,10,4,4,8,4,88,52,38,13,9,8,10);
+INSERT INTO "match" VALUES(719,9,'2025-09-24',39,'O','HH26','TC61','6-3 7-6(4)','R64',106,9,2,71,51,40,11,11,3,4,10,0,75,57,37,10,10,5,7);
+INSERT INTO "match" VALUES(720,9,'2025-09-24',40,'O','MU94','C0E9','7-5 6-1','R64',92,2,1,53,27,24,17,10,1,1,2,5,61,37,24,12,9,3,6);
+INSERT INTO "match" VALUES(721,9,'2025-09-24',41,'O','H997','TD51','6-7(9) 6-2 6-1','R64',170,21,1,96,70,50,15,14,1,3,5,4,98,51,33,25,13,12,18);
+INSERT INTO "match" VALUES(722,9,'2025-09-24',42,'O','GJ37','B0CD','6-1 1-6 6-1','R64',106,5,2,67,43,31,11,11,5,7,0,3,60,40,25,6,10,9,13);
+INSERT INTO "match" VALUES(723,9,'2025-09-24',43,'O','D0F6','BM95','6-4 6-4','R64',88,4,2,49,32,29,11,10,0,0,7,2,61,40,30,8,10,2,4);
+INSERT INTO "match" VALUES(724,9,'2025-09-24',44,'O','M0GZ','N0BG','6-3 7-6(4)','R64',99,11,1,76,53,41,13,11,4,5,3,3,65,35,23,18,10,2,4);
+INSERT INTO "match" VALUES(725,9,'2025-09-24',45,'O','FB98','M0CI','2-6 7-6(4) 7-6(1)','R64',140,15,1,93,60,51,19,16,3,5,7,1,109,76,56,20,16,8,8);
+INSERT INTO "match" VALUES(726,9,'2025-09-24',46,'O','BU13','RH16','3-6 7-5 4-1 RET','R64',128,11,5,67,32,27,24,13,4,5,4,5,84,49,37,17,13,2,4);
+INSERT INTO "match" VALUES(727,9,'2025-09-24',47,'O','S0AG','AE14','6-3 6-3','R64',98,3,0,54,34,30,9,9,2,2,5,2,61,35,22,13,9,1,4);
+INSERT INTO "match" VALUES(728,9,'2025-09-24',48,'O','Z355','R0EB','6-4 6-4','R64',98,12,2,61,44,34,10,10,5,5,3,0,62,43,27,13,10,2,4);
+INSERT INTO "match" VALUES(729,9,'2025-09-24',49,'O','DH58','U182','6-4 6-2','R64',88,3,1,45,30,26,11,9,0,0,6,1,63,42,24,12,9,6,9);
+INSERT INTO "match" VALUES(730,9,'2025-09-24',50,'O','M0EJ','C0DF','6-4 6-0','R64',87,1,0,43,26,21,11,8,0,0,2,2,48,26,18,6,8,5,9);
+INSERT INTO "match" VALUES(731,9,'2025-09-24',51,'O','AG37','TE30','6-3 6-3','R64',85,11,2,67,47,35,9,9,7,7,2,0,54,38,21,10,9,2,5);
+INSERT INTO "match" VALUES(732,9,'2025-09-24',52,'O','N732','RE44','2-6 6-1 6-4','R64',107,3,0,74,49,36,16,13,5,7,2,0,65,46,36,7,12,2,5);
+INSERT INTO "match" VALUES(733,9,'2025-09-24',53,'O','L0BV','HB64','6-4 7-5','R64',85,8,2,58,42,35,10,11,0,0,5,3,60,34,29,10,11,1,3);
+INSERT INTO "match" VALUES(734,9,'2025-09-24',54,'O','MM58','S0GD','6-1 6-1','R64',60,2,2,35,29,24,4,7,0,0,0,1,43,30,10,6,7,4,9);
+INSERT INTO "match" VALUES(735,9,'2025-09-24',55,'O','D0C1','M0NI','4-6 7-6(2) 6-4','R64',148,17,3,102,67,50,18,16,7,9,13,3,101,63,53,19,16,2,4);
+INSERT INTO "match" VALUES(736,9,'2025-09-24',56,'O','DH50','A0FC','6-4 6-4','R64',90,5,0,58,36,25,14,10,2,4,5,1,64,45,35,10,10,2,2);
+INSERT INTO "match" VALUES(737,9,'2025-09-24',57,'O','SU55','O483','6-3 6-2','R64',72,11,3,54,33,25,12,9,2,3,3,0,49,26,16,8,8,5,9);
+INSERT INTO "match" VALUES(738,9,'2025-09-24',58,'O','D0FJ','Y09V','6-4 6-4','R64',90,9,0,52,33,28,11,10,2,3,10,0,55,31,25,9,10,2,5);
+INSERT INTO "match" VALUES(739,9,'2025-09-24',59,'O','RC91','M0QI','6-3 6-4','R64',106,3,2,64,41,30,11,9,7,8,4,0,60,43,27,8,10,2,6);
+INSERT INTO "match" VALUES(740,9,'2025-09-24',60,'O','MQ75','N0AE','6-4 6-0','R64',70,11,0,49,36,26,7,8,0,1,5,2,54,32,17,9,8,6,11);
+INSERT INTO "match" VALUES(741,9,'2025-09-24',61,'O','N771','C0H0','6-3 0-6 7-6(5)','R64',127,1,1,68,45,34,15,13,0,3,15,2,84,57,46,12,14,3,5);
+INSERT INTO "match" VALUES(742,9,'2025-09-24',62,'O','T0HA','MW02','4-6 6-4 6-4','R64',156,2,4,81,54,33,14,15,2,7,5,2,101,60,40,17,15,6,12);
+INSERT INTO "match" VALUES(743,9,'2025-09-24',63,'O','S0RE','KE29','7-6(3) 6-3','R64',101,5,2,65,45,39,6,11,0,2,8,1,62,42,30,8,10,0,3);
+INSERT INTO "match" VALUES(744,9,'2025-09-24',64,'O','BT72','V832','7-6(7) 6-4','R64',102,7,1,73,52,40,10,11,2,3,10,0,75,44,31,16,11,4,6);
+INSERT INTO "match" VALUES(745,9,'2025-09-24',65,'O','D643','H997','4-6 7-5 6-3','R32',162,7,1,89,54,46,20,16,2,3,13,0,87,54,41,17,15,1,3);
+INSERT INTO "match" VALUES(746,9,'2025-09-24',66,'O','M0GZ','FB98','6-4 7-5','R32',85,12,2,57,40,32,13,11,0,0,9,1,61,42,33,11,11,4,6);
+INSERT INTO "match" VALUES(747,9,'2025-09-24',67,'O','R0DG','HH26','6-4 6-4','R32',94,6,2,52,31,25,14,10,0,1,6,4,54,30,23,11,10,2,5);
+INSERT INTO "match" VALUES(748,9,'2025-09-24',68,'O','BU13','C0AU','7-6(1) 6-3','R32',130,6,2,76,45,36,13,11,6,8,9,3,80,44,27,17,10,8,11);
+INSERT INTO "match" VALUES(749,9,'2025-09-24',69,'O','VA25','M0FH','6-0 3-1 RET','R32',53,3,0,26,16,13,9,5,0,0,1,1,52,31,17,6,5,9,13);
+INSERT INTO "match" VALUES(750,9,'2025-09-24',70,'O','D0F6','GB88','3-0 RET','R32',10,4,0,10,8,6,2,2,0,0,0,1,8,4,3,0,1,0,1);
+INSERT INTO "match" VALUES(751,9,'2025-09-24',71,'O','MU94','N732','6-4 5-7 6-1','R32',148,12,1,98,69,51,14,15,8,11,3,2,74,49,36,7,14,3,8);
+INSERT INTO "match" VALUES(752,9,'2025-09-24',72,'O','GJ37','S0AG','6-7(3) 7-5 3-2 RET','R32',156,17,1,99,68,53,15,14,6,6,10,2,79,59,44,15,15,1,3);
+INSERT INTO "match" VALUES(753,9,'2025-09-24',73,'O','DH58','MQ75','6-1 7-5','R32',87,4,0,45,31,24,10,9,1,2,8,3,75,45,28,10,10,6,11);
+INSERT INTO "match" VALUES(754,9,'2025-09-24',74,'O','AG37','D0C1','6-4 7-5','R32',100,7,3,63,39,30,15,11,3,4,3,1,57,40,29,9,11,1,4);
+INSERT INTO "match" VALUES(755,9,'2025-09-24',75,'O','BT72','S0RE','7-6(5) 4-6 6-3','R32',147,17,6,101,67,51,17,16,3,5,6,0,93,70,51,11,15,2,4);
+INSERT INTO "match" VALUES(756,9,'2025-09-24',76,'O','L0BV','SU55','6-4 6-4','R32',93,5,2,56,35,26,12,10,1,3,8,6,75,47,30,11,10,10,14);
+INSERT INTO "match" VALUES(757,9,'2025-09-24',77,'O','RC91','Z355','4-6 6-3 6-2','R32',132,7,1,78,54,40,18,14,6,7,7,2,71,52,37,9,13,3,6);
+INSERT INTO "match" VALUES(758,9,'2025-09-24',78,'O','M0EJ','D0FJ','7-5 7-6(1)','R32',131,11,2,87,63,43,13,12,6,8,2,2,77,48,37,9,12,5,8);
+INSERT INTO "match" VALUES(759,9,'2025-09-24',79,'O','MM58','DH50','6-3 7-6(5)','R32',111,9,1,61,35,33,15,11,1,1,1,2,80,53,38,11,10,8,9);
+INSERT INTO "match" VALUES(760,9,'2025-09-24',80,'O','T0HA','N771','7-6(4) 6-3','R32',107,4,4,74,46,34,13,10,8,10,3,1,69,48,34,4,11,2,6);
+INSERT INTO "match" VALUES(761,9,'2025-09-24',81,'O','BU13','D0F6','3-6 7-5 7-6(8)','R16',168,10,3,101,66,47,21,16,2,5,10,3,100,75,57,10,17,1,4);
+INSERT INTO "match" VALUES(762,9,'2025-09-24',82,'O','R0DG','M0GZ','6-4 6-7(7) 6-3','R16',148,9,0,93,59,48,24,16,3,3,16,5,96,63,47,19,15,5,7);
+INSERT INTO "match" VALUES(763,9,'2025-09-24',83,'O','D643','MU94','6-3 5-7 6-2','R16',161,3,0,84,58,44,16,15,1,2,3,0,86,49,29,26,14,5,8);
+INSERT INTO "match" VALUES(764,9,'2025-09-24',84,'O','VA25','GJ37','4-6 7-6(1) 6-4','R16',142,13,1,103,71,53,19,16,6,7,11,1,81,60,48,14,16,3,4);
+INSERT INTO "match" VALUES(765,9,'2025-09-24',85,'O','DH58','BT72','7-5 6-2','R16',107,2,0,54,33,26,17,10,3,3,2,0,86,56,36,11,10,9,12);
+INSERT INTO "match" VALUES(766,9,'2025-09-24',86,'O','RC91','L0BV','6-3 7-6(5)','R16',91,9,0,56,44,41,8,11,0,0,3,2,65,41,33,12,10,2,3);
+INSERT INTO "match" VALUES(767,9,'2025-09-24',87,'O','AG37','M0EJ','6-4 6-2','R16',85,6,1,53,41,31,7,9,3,3,3,0,58,39,23,11,9,3,6);
+INSERT INTO "match" VALUES(768,9,'2025-09-24',88,'O','MM58','T0HA','7-6(6) 6-7(1) 6-4','R16',172,10,11,111,75,59,10,17,2,5,2,3,114,76,48,23,17,8,12);
+INSERT INTO "match" VALUES(769,9,'2025-09-24',89,'O','VA25','R0DG','2-6 7-6(4) 6-4','QF',179,7,1,121,83,54,19,15,7,10,12,4,98,67,49,13,15,2,4);
+INSERT INTO "match" VALUES(770,9,'2025-09-24',90,'O','D643','BU13','6-3 7-5','QF',110,6,1,67,49,39,8,11,4,5,7,4,64,42,32,7,10,6,9);
+INSERT INTO "match" VALUES(771,9,'2025-09-24',91,'O','RC91','AG37','6-3 6-4','QF',88,5,1,54,34,29,13,10,3,3,8,3,57,41,26,10,9,0,2);
+INSERT INTO "match" VALUES(772,9,'2025-09-24',92,'O','MM58','DH58','6-4 6-4','QF',113,5,6,69,42,33,14,10,6,6,1,1,71,49,34,8,10,4,6);
+INSERT INTO "match" VALUES(773,9,'2025-09-24',93,'O','VA25','D643','6-3 6-4','SF',113,5,6,69,42,33,14,10,6,6,1,1,71,49,34,8,10,4,6);
+INSERT INTO "match" VALUES(774,9,'2025-09-24',94,'O','RC91','MM58','4-6 6-2 6-4','SF',149,12,6,111,75,51,18,14,10,11,11,4,78,51,39,12,14,3,6);
+INSERT INTO "match" VALUES(775,9,'2025-09-24',95,'O','VA25','RC91','4-6 6-3 6-3','F',134,8,1,72,49,38,17,14,0,1,11,1,89,63,43,14,14,11,14);
+INSERT INTO "match" VALUES(776,10,'2025-05-26',1,'O','Z355','T0HA','6-3 6-3 6-4','R128',NULL,3,3,74,51,46,14,14,4,4,2,3,90,57,37,15,14,8,12);
+INSERT INTO "match" VALUES(777,10,'2025-05-26',2,'O','D0CO','B0GG','3-6 6-1 6-4 6-2','R128',NULL,11,7,101,69,51,19,17,4,6,9,1,111,63,39,24,17,12,18);
+INSERT INTO "match" VALUES(778,10,'2025-05-26',3,'O','D643','MK66','6-3 6-3 6-3','R128',NULL,7,1,71,47,38,17,14,4,5,6,3,79,52,31,13,13,4,9);
+INSERT INTO "match" VALUES(779,10,'2025-05-26',4,'O','DH58','DB63','6-3 6-4 7-6(6)','R128',NULL,2,5,99,43,32,34,16,3,5,2,4,108,69,43,20,15,1,5);
+INSERT INTO "match" VALUES(780,10,'2025-05-26',5,'O','N771','MM58','7-5 6-3 4-6 1-6 7-5','R128',NULL,1,2,171,112,71,31,25,9,15,16,3,154,93,65,32,25,6,12);
+INSERT INTO "match" VALUES(781,10,'2025-05-26',6,'O','Q02L','D875','2-6 3-6 6-2 RET','R128',NULL,7,3,86,59,35,14,12,4,8,7,5,84,49,35,14,13,4,7);
+INSERT INTO "match" VALUES(782,10,'2025-05-26',7,'O','RE44','HG86','6-4 4-6 6-3 6-1','R128',NULL,13,2,103,65,46,26,18,5,7,13,4,114,73,45,19,18,8,14);
+INSERT INTO "match" VALUES(783,10,'2025-05-26',8,'O','M0NI','MP20','7-5 6-7(5) 7-5 6-3','R128',NULL,20,3,135,89,72,25,23,3,5,8,5,139,94,64,26,22,6,11);
+INSERT INTO "match" VALUES(784,10,'2025-05-26',9,'O','A0FC','AG37','5-7 2-6 6-3 6-4 6-2','R128',NULL,7,8,172,102,73,32,24,16,20,8,7,137,80,57,32,23,12,17);
+INSERT INTO "match" VALUES(785,10,'2025-05-26',10,'O','F0FV','HB71','6-2 6-4 6-2','R128',NULL,9,0,71,51,40,14,13,2,2,6,0,79,51,34,9,13,7,12);
+INSERT INTO "match" VALUES(786,10,'2025-05-26',11,'O','BK92','D994','6-2 6-4 6-4','R128',NULL,16,9,101,61,50,21,14,4,4,2,5,92,67,42,10,14,5,9);
+INSERT INTO "match" VALUES(787,10,'2025-05-26',12,'O','C0E9','C977','6-2 6-1 6-3','R128',NULL,3,2,70,46,34,16,12,3,3,4,4,74,35,20,17,12,3,9);
+INSERT INTO "match" VALUES(788,10,'2025-05-26',13,'O','D0C1','P0CT','3-6 6-7(7) 6-4 7-6(1) 6-1','R128',NULL,9,4,147,96,77,26,25,2,6,3,6,178,123,81,24,25,11,17);
+INSERT INTO "match" VALUES(789,10,'2025-05-26',14,'O','GJ16','K0AZ','4-6 6-4 6-4 6-1','R128',NULL,16,4,111,59,45,30,19,3,6,2,7,116,63,43,24,18,11,17);
+INSERT INTO "match" VALUES(790,10,'2025-05-26',15,'O','H996','BM95','7-5 3-6 4-6 7-5 6-2','R128',NULL,11,17,146,90,68,24,26,3,8,3,3,155,117,78,19,25,8,14);
+INSERT INTO "match" VALUES(791,10,'2025-05-26',16,'O','MC65','DA31','4-6 3-6 6-1 7-6(4) 6-1','R128',NULL,21,4,147,89,66,27,23,11,16,2,1,155,124,73,14,22,14,21);
+INSERT INTO "match" VALUES(792,10,'2025-05-26',17,'O','MW02','T09X','6-3 7-6(6) 6-3','R128',NULL,3,6,109,54,40,31,14,8,10,3,3,111,71,40,24,16,5,11);
+INSERT INTO "match" VALUES(793,10,'2025-05-26',18,'O','R0GO','BG23','7-6(0) 2-6 7-6(9) 2-6 6-2','R128',NULL,13,5,159,93,67,35,24,6,11,5,10,182,94,76,39,24,12,15);
+INSERT INTO "match" VALUES(794,10,'2025-05-26',19,'O','S0H2','L987','6-2 6-4 7-6(4)','R128',NULL,3,3,100,67,51,15,15,6,8,3,1,100,69,41,18,15,3,8);
+INSERT INTO "match" VALUES(795,10,'2025-05-26',20,'O','W09E','MN13','7-6(3) 4-6 6-3 2-6 6-2','R128',NULL,11,2,152,101,73,23,24,8,13,6,4,153,112,71,23,23,10,15);
+INSERT INTO "match" VALUES(796,10,'2025-05-26',21,'O','S0AG','RC91','6-4 6-3 7-5','R128',NULL,4,0,89,60,45,20,16,5,7,7,2,88,52,37,15,15,1,6);
+INSERT INTO "match" VALUES(797,10,'2025-05-26',22,'O','A0E2','Z0A1','6-3 6-4 6-2','R128',NULL,3,4,86,57,44,17,14,3,3,6,0,85,55,37,11,13,4,8);
+INSERT INTO "match" VALUES(798,10,'2025-05-26',23,'O','AE14','FB98','7-5 3-6 6-3 6-1','R128',NULL,7,4,112,62,47,30,18,4,5,14,0,110,58,46,25,19,3,8);
+INSERT INTO "match" VALUES(799,10,'2025-05-26',24,'O','RH16','R772','6-3 6-4 6-2','R128',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(800,10,'2025-05-26',25,'O','R0DG','BD06','6-7(4) 6-4 6-3 6-2','R128',NULL,9,0,135,92,65,25,20,10,11,4,2,117,66,51,22,19,8,13);
+INSERT INTO "match" VALUES(801,10,'2025-05-26',26,'O','F0F1','J551','6-3 6-4 6-7(6) 6-3','R128',NULL,8,2,126,83,63,29,21,3,3,4,8,162,106,67,29,19,13,16);
+INSERT INTO "match" VALUES(802,10,'2025-05-26',27,'O','D0F6','C0AU','7-5 6-3 6-4','R128',NULL,4,2,94,59,46,21,16,0,1,4,3,88,56,37,18,15,7,11);
+INSERT INTO "match" VALUES(803,10,'2025-05-26',28,'O','TE51','EA24','7-5 6-3 6-4','R128',NULL,12,3,93,53,41,25,16,1,2,8,6,108,58,39,23,15,9,13);
+INSERT INTO "match" VALUES(804,10,'2025-05-26',29,'O','HH26','O483','7-5 6-3 7-6(3)','R128',NULL,8,2,116,64,40,36,17,12,15,4,6,118,69,44,20,16,12,17);
+INSERT INTO "match" VALUES(805,10,'2025-05-26',30,'O','K0AH','D0FJ','6-2 4-6 6-3 6-2','R128',NULL,7,1,107,68,45,27,18,4,6,5,9,96,54,37,16,17,6,12);
+INSERT INTO "match" VALUES(806,10,'2025-05-26',31,'O','KE29','V832','6-4 6-4 6-4','R128',NULL,9,1,87,54,42,17,15,2,4,2,3,102,52,38,20,15,7,12);
+INSERT INTO "match" VALUES(807,10,'2025-05-26',32,'O','P09Z','N732','7-5 6-4 1-2 RET','R128',NULL,10,1,63,41,34,17,12,0,0,1,2,83,48,35,18,13,6,8);
+INSERT INTO "match" VALUES(808,10,'2025-05-26',33,'O','DH50','L0CX','6-3 6-2 6-7(4) 6-3','R128',NULL,2,4,129,99,68,16,20,8,11,2,2,128,95,53,18,18,12,19);
+INSERT INTO "match" VALUES(809,10,'2025-05-26',34,'O','SU55','MO44','6-2 6-0 6-3','R128',NULL,8,7,71,44,32,12,12,2,4,0,4,67,45,24,4,11,3,11);
+INSERT INTO "match" VALUES(810,10,'2025-05-26',35,'O','F0BY','W367','7-6(6) 6-3 6-2','R128',NULL,9,6,81,50,50,14,15,3,5,5,2,86,47,29,23,14,2,7);
+INSERT INTO "match" VALUES(811,10,'2025-05-26',36,'O','G628','A0GC','6-2 2-6 6-3 6-0','R128',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(812,10,'2025-05-26',37,'O','G09O','BV16','2-6 6-0 2-6 6-3 6-4','R128',NULL,1,4,145,94,59,24,20,11,17,9,3,124,65,39,29,21,5,13);
+INSERT INTO "match" VALUES(813,10,'2025-05-26',38,'O','GJ37','GC88','4-6 6-3 6-4 7-5','R128',NULL,8,2,108,75,63,19,21,0,2,11,2,136,80,56,27,20,9,13);
+INSERT INTO "match" VALUES(814,10,'2025-05-26',39,'O','KI95','B0BI','6-7(3) 6-7(4) 6-4 6-2 6-2','R128',NULL,6,2,163,91,61,38,25,8,13,8,6,189,135,78,23,25,17,27);
+INSERT INTO "match" VALUES(815,10,'2025-05-26',40,'O','L0BV','TC61','6-4 6-2 6-1','R128',NULL,8,3,78,49,38,14,13,3,5,3,1,78,42,23,17,12,10,17);
+INSERT INTO "match" VALUES(816,10,'2025-05-26',41,'O','M0JZ','Y09V','5-7 7-6(3) 7-6(4) 6-1','R128',NULL,9,4,166,111,80,31,22,13,15,12,1,129,71,57,32,21,5,8);
+INSERT INTO "match" VALUES(817,10,'2025-05-26',42,'O','MU94','U182','6-4 6-1 7-5','R128',NULL,3,4,88,49,40,21,14,3,4,3,5,107,56,32,25,15,8,14);
+INSERT INTO "match" VALUES(818,10,'2025-05-26',43,'O','O513','SL28','7-6(5) 6-3 6-7(5) 6-2','R128',NULL,22,3,145,84,65,35,20,11,11,14,6,133,86,69,18,21,5,9);
+INSERT INTO "match" VALUES(819,10,'2025-05-26',44,'O','TE30','C0H0','5-7 6-3 6-2 1-6 6-3','R128',NULL,5,2,154,91,59,37,23,10,14,11,5,120,68,49,27,22,4,9);
+INSERT INTO "match" VALUES(820,10,'2025-05-26',45,'O','M0EJ','H997','7-5 6-2 6-0','R128',NULL,5,1,70,46,38,15,13,0,0,0,3,99,62,31,20,13,7,13);
+INSERT INTO "match" VALUES(821,10,'2025-05-26',46,'O','PL56','M0K4','6-7(5) 6-2 6-3 6-1','R128',NULL,5,4,126,77,49,28,18,5,9,4,7,121,73,42,21,18,11,21);
+INSERT INTO "match" VALUES(822,10,'2025-05-26',47,'O','S0S1','SU87','6-4 4-6 3-6 6-2 6-3','R128',NULL,15,5,140,103,72,20,23,6,10,3,4,126,85,56,21,23,3,9);
+INSERT INTO "match" VALUES(823,10,'2025-05-26',48,'O','TD51','SX50','6-4 7-5 6-4','R128',NULL,9,1,99,59,45,25,16,6,7,20,2,93,53,44,25,16,8,12);
+INSERT INTO "match" VALUES(824,10,'2025-05-26',49,'O','HB64','M0FH','7-6(4) 4-1','R128',NULL,8,1,46,25,20,15,8,2,2,5,3,57,41,26,8,9,0,2);
+INSERT INTO "match" VALUES(825,10,'2025-05-26',50,'O','N0BS','N0AE','7-6(2) 4-6 6-1 6-2','R128',NULL,5,2,138,94,64,18,19,12,18,3,2,124,72,38,24,18,8,17);
+INSERT INTO "match" VALUES(826,10,'2025-05-26',51,'O','M0GZ','BU13','4-6 6-3 7-6(5) 6-4','R128',NULL,12,5,127,78,59,27,21,8,11,8,8,138,78,54,34,20,8,12);
+INSERT INTO "match" VALUES(827,10,'2025-05-26',52,'O','C0C8','M0QI','6-3 6-2 6-4','R128',NULL,1,3,79,35,29,25,14,1,3,2,3,89,66,38,6,13,8,14);
+INSERT INTO "match" VALUES(828,10,'2025-05-26',53,'O','BT72','J0AZ','3-6 6-7(3) 6-4 6-3 6-3','R128',NULL,8,4,161,110,79,22,24,7,11,8,6,185,98,71,37,25,15,22);
+INSERT INTO "match" VALUES(829,10,'2025-05-26',54,'O','B0CD','F0F2','6-1 3-6 6-3 6-2','R128',NULL,1,3,105,67,47,26,17,8,9,3,3,95,63,43,15,16,4,9);
+INSERT INTO "match" VALUES(830,10,'2025-05-26',55,'O','CD85','C0DF','6-2 7-6(3) 7-5','R128',NULL,0,3,118,78,56,20,16,5,7,7,3,106,59,39,19,16,3,8);
+INSERT INTO "match" VALUES(831,10,'2025-05-26',56,'O','D923','T0A1','3-6 6-4 6-3 7-5','R128',NULL,1,2,137,100,68,21,20,12,14,4,2,148,89,55,33,20,11,15);
+INSERT INTO "match" VALUES(832,10,'2025-05-26',57,'O','F724','S0N0','6-4 6-2 6-2','R128',NULL,1,2,74,51,37,15,13,3,4,5,4,101,61,40,13,13,14,20);
+INSERT INTO "match" VALUES(833,10,'2025-05-26',58,'O','GE33','R0EB','7-6(6) 6-3 3-6 6-7(4) 7-5','R128',NULL,17,6,200,132,86,36,27,13,19,14,6,155,89,65,34,27,5,12);
+INSERT INTO "match" VALUES(834,10,'2025-05-26',59,'O','G0GD','HG94','6-4 6-2 6-0','R128',NULL,5,2,68,40,33,16,12,3,4,1,3,90,42,24,16,12,7,14);
+INSERT INTO "match" VALUES(835,10,'2025-05-26',60,'O','KI82','MJ08','6-4 6-3 4-6 6-7(6) 6-1','R128',NULL,11,6,131,92,72,22,23,3,5,9,4,166,86,65,36,25,6,13);
+INSERT INTO "match" VALUES(836,10,'2025-05-26',61,'O','M0CI','N0BG','6-2 6-3 7-6(3)','R128',NULL,0,2,88,51,38,27,15,4,5,5,8,106,66,44,19,14,13,17);
+INSERT INTO "match" VALUES(837,10,'2025-05-26',62,'O','M0JF','MQ75','6-3 6-3 7-6(2)','R128',NULL,13,5,99,67,48,15,15,3,6,6,3,90,57,34,15,15,4,10);
+INSERT INTO "match" VALUES(838,10,'2025-05-26',63,'O','N0AM','V812','6-2 7-5 7-5','R128',NULL,8,3,122,84,60,18,16,8,10,2,8,125,63,41,27,16,7,13);
+INSERT INTO "match" VALUES(839,10,'2025-05-26',64,'O','O522','H0BH','1-6 6-3 7-5 7-6(3)','R128',NULL,22,7,113,70,56,22,20,1,4,3,5,125,77,58,25,20,8,11);
+INSERT INTO "match" VALUES(840,10,'2025-05-26',65,'O','S0AG','G628','6-3 6-0 6-4','R64',NULL,3,0,72,54,46,8,13,3,3,2,5,81,45,30,14,12,6,11);
+INSERT INTO "match" VALUES(841,10,'2025-05-26',66,'O','Z355','D0C1','3-6 6-1 6-2 6-3','R64',NULL,8,1,101,78,52,16,16,7,9,4,3,122,60,32,31,17,6,13);
+INSERT INTO "match" VALUES(842,10,'2025-05-26',67,'O','D0CO','MC65','6-3 4-6 6-3 7-5','R64',NULL,5,3,116,75,54,24,20,6,10,8,7,153,88,59,24,20,15,22);
+INSERT INTO "match" VALUES(843,10,'2025-05-26',68,'O','D643','MW02','6-3 6-2 7-6(1)','R64',NULL,5,2,107,70,51,18,15,3,5,4,3,106,68,41,14,14,9,14);
+INSERT INTO "match" VALUES(844,10,'2025-05-26',69,'O','BK92','DH58','2-6 2-6 6-4 6-3 6-2','R64',NULL,12,12,130,79,58,22,22,7,13,4,8,128,61,45,35,21,8,14);
+INSERT INTO "match" VALUES(845,10,'2025-05-26',70,'O','F0F1','MU94','7-6(3) 7-6(4) 2-6 0-6 6-4','R64',NULL,2,7,173,110,67,28,24,13,22,9,13,158,100,73,22,24,8,13);
+INSERT INTO "match" VALUES(846,10,'2025-05-26',71,'O','RE44','W09E','7-6(1) 6-1 7-6(5)','R64',NULL,18,4,101,58,49,26,16,1,2,7,1,115,68,48,20,15,11,14);
+INSERT INTO "match" VALUES(847,10,'2025-05-26',72,'O','R0GO','M0NI','2-6 1-6 6-4 6-3 6-3','R64',NULL,7,6,133,85,54,25,21,6,12,9,4,122,75,51,26,22,5,11);
+INSERT INTO "match" VALUES(848,10,'2025-05-26',73,'O','F0BY','HH26','6-3 4-4 RET','R64',NULL,3,5,50,28,20,12,8,3,5,3,5,77,47,27,13,9,8,12);
+INSERT INTO "match" VALUES(849,10,'2025-05-26',74,'O','L0BV','DH50','6-3 3-6 6-1 6-2','R64',NULL,12,0,101,73,57,15,17,3,4,3,3,98,73,48,11,16,2,7);
+INSERT INTO "match" VALUES(850,10,'2025-05-26',75,'O','M0JZ','SU55','7-6(5) 7-6(6) 4-6 4-6 6-3','R64',NULL,9,6,170,107,79,32,27,10,16,6,8,182,111,75,36,26,10,15);
+INSERT INTO "match" VALUES(851,10,'2025-05-26',76,'O','C0E9','A0FC','6-3 6-3 6-7(6) 6-1','R64',NULL,1,1,122,64,45,30,19,4,9,1,8,121,57,38,23,18,9,19);
+INSERT INTO "match" VALUES(852,10,'2025-05-26',77,'O','F0FV','H996','7-6(4) 7-6(4) 6-4','R64',NULL,9,8,108,70,54,15,17,5,9,12,10,127,65,44,31,17,8,13);
+INSERT INTO "match" VALUES(853,10,'2025-05-26',78,'O','GJ37','D0F6','7-5 7-6(3) 1-6 6-3','R64',NULL,12,6,133,75,51,30,20,7,13,12,6,113,72,50,19,20,5,11);
+INSERT INTO "match" VALUES(854,10,'2025-05-26',79,'O','N771','GJ16','7-6(7) 6-2 6-1','R64',NULL,4,2,94,73,52,10,13,9,10,3,8,104,69,38,16,14,8,14);
+INSERT INTO "match" VALUES(855,10,'2025-05-26',80,'O','Q02L','S0H2','6-4 4-6 6-7(5) 7-6(3) 7-5','R64',NULL,14,6,195,107,78,48,28,12,16,11,2,179,115,85,30,28,8,13);
+INSERT INTO "match" VALUES(856,10,'2025-05-26',81,'O','A0E2','M0CI','6-1 4-6 6-1 6-2','R64',NULL,5,1,92,71,50,13,16,1,3,4,2,113,75,41,14,16,9,17);
+INSERT INTO "match" VALUES(857,10,'2025-05-26',82,'O','BT72','RH16','2-6 6-4 6-1 6-0','R64',NULL,8,0,95,72,51,10,15,7,10,8,4,99,63,36,13,16,4,12);
+INSERT INTO "match" VALUES(858,10,'2025-05-26',83,'O','M0EJ','GE33','6-4 6-0 6-4','R64',NULL,6,0,81,57,40,19,13,6,7,0,2,77,58,32,10,13,6,12);
+INSERT INTO "match" VALUES(859,10,'2025-05-26',84,'O','R0DG','N0AM','6-3 7-6(5) 6-3','R64',NULL,4,3,97,64,47,21,16,7,9,5,6,102,69,45,14,14,8,12);
+INSERT INTO "match" VALUES(860,10,'2025-05-26',85,'O','PL56','F724','4-6 2-6 6-3 7-5 6-4','R64',NULL,6,3,138,98,75,17,25,6,11,7,3,141,94,69,23,24,9,14);
+INSERT INTO "match" VALUES(861,10,'2025-05-26',86,'O','S0S1','G09O','W/O','R64',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(862,10,'2025-05-26',87,'O','TD51','CD85','6-4 6-3 6-1','R64',NULL,9,2,66,40,33,19,13,0,0,2,3,85,52,35,13,13,8,13);
+INSERT INTO "match" VALUES(863,10,'2025-05-26',88,'O','G0GD','TE51','6-4 5-7 6-2 6-4','R64',NULL,9,2,123,76,60,24,20,11,13,4,6,119,77,57,18,20,9,14);
+INSERT INTO "match" VALUES(864,10,'2025-05-26',89,'O','K0AH','B0CD','6-1 6-2 7-6(2)','R64',NULL,3,2,98,58,40,22,14,6,9,1,1,87,57,30,12,13,7,14);
+INSERT INTO "match" VALUES(865,10,'2025-05-26',90,'O','KE29','O513','7-5 3-6 7-5 4-6 6-2','R64',NULL,7,7,173,109,82,26,25,10,15,12,4,183,108,74,33,26,9,16);
+INSERT INTO "match" VALUES(866,10,'2025-05-26',91,'O','P09Z','TE30','7-5 6-3 6-4','R64',NULL,8,1,86,56,43,17,15,6,8,2,4,104,70,41,18,16,6,12);
+INSERT INTO "match" VALUES(867,10,'2025-05-26',92,'O','D923','M0GZ','7-6(4) 6-3 4-6 6-4','R64',NULL,0,4,133,100,75,17,21,3,5,10,3,108,72,53,22,20,0,3);
+INSERT INTO "match" VALUES(868,10,'2025-05-26',93,'O','AE14','KI82','6-2 4-6 6-3 7-5','R64',NULL,8,4,155,100,67,31,20,17,19,7,1,112,79,53,15,19,1,6);
+INSERT INTO "match" VALUES(869,10,'2025-05-26',94,'O','HB64','KI95','4-6 6-3 7-6(2) 7-5','R64',NULL,22,9,150,78,56,46,22,14,15,5,1,126,81,58,27,21,2,4);
+INSERT INTO "match" VALUES(870,10,'2025-05-26',95,'O','M0JF','C0C8','6-3 6-4 7-5','R64',NULL,4,5,95,60,44,13,15,5,8,6,6,105,54,33,22,16,7,14);
+INSERT INTO "match" VALUES(871,10,'2025-05-26',96,'O','N0BS','O522','6-1 7-6(1) 6-3','R64',NULL,3,0,99,71,50,16,15,10,12,7,9,99,52,31,23,13,11,16);
+INSERT INTO "match" VALUES(872,10,'2025-05-26',97,'O','S0AG','L0BV','6-0 6-1 6-2','R32',NULL,3,0,55,35,29,17,11,1,1,3,1,81,51,22,14,10,11,18);
+INSERT INTO "match" VALUES(873,10,'2025-05-26',98,'O','Z355','C0E9','6-2 7-6(4) 6-1','R32',NULL,8,1,92,72,49,12,14,3,5,0,3,101,57,30,22,13,9,15);
+INSERT INTO "match" VALUES(874,10,'2025-05-26',99,'O','D0CO','F0FV','6-2 6-4 6-2','R32',NULL,8,4,68,40,37,17,13,2,2,6,0,84,59,37,9,13,6,11);
+INSERT INTO "match" VALUES(875,10,'2025-05-26',100,'O','D643','M0JZ','6-3 6-4 6-2','R32',NULL,6,0,75,51,41,16,14,1,1,6,2,90,55,39,13,13,12,16);
+INSERT INTO "match" VALUES(876,10,'2025-05-26',101,'O','RE44','F0F1','W/O','R32',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(877,10,'2025-05-26',102,'O','BK92','R0GO','7-5 6-1 6-2','R32',NULL,9,6,68,47,41,17,14,2,2,9,8,68,45,29,17,13,6,11);
+INSERT INTO "match" VALUES(878,10,'2025-05-26',103,'O','GJ37','Q02L','4-6 6-1 6-7(2) 6-1 6-4','R32',NULL,7,4,139,101,80,18,24,5,7,8,8,153,101,66,28,22,13,19);
+INSERT INTO "match" VALUES(879,10,'2025-05-26',104,'O','N771','F0BY','6-3 7-6(1) 6-2','R32',NULL,2,4,106,60,41,26,15,7,11,8,13,106,61,36,17,14,5,12);
+INSERT INTO "match" VALUES(880,10,'2025-05-26',105,'O','A0E2','D923','6-1 6-3 4-6 6-4','R32',NULL,4,5,131,92,59,22,18,9,12,0,6,126,75,41,27,18,14,21);
+INSERT INTO "match" VALUES(881,10,'2025-05-26',106,'O','M0EJ','N0BS','4-6 6-4 6-3 6-2','R32',NULL,3,4,115,75,52,18,19,4,9,1,2,132,97,51,17,18,11,19);
+INSERT INTO "match" VALUES(882,10,'2025-05-26',107,'O','R0DG','HB64','4-6 6-2 5-7 7-5 6-2','R32',NULL,8,0,136,99,78,16,25,7,11,13,10,143,81,62,26,25,4,11);
+INSERT INTO "match" VALUES(883,10,'2025-05-26',108,'O','PL56','KE29','6-3 3-6 7-6(7) 3-6 6-3','R32',NULL,8,4,159,100,69,25,24,9,15,5,3,166,104,66,33,24,6,12);
+INSERT INTO "match" VALUES(884,10,'2025-05-26',109,'O','S0S1','G0GD','6-3 6-3 6-4','R32',NULL,10,7,82,47,37,20,14,3,4,4,2,101,59,38,19,14,6,11);
+INSERT INTO "match" VALUES(885,10,'2025-05-26',110,'O','TD51','K0AH','7-6(6) 6-3 6-4','R32',NULL,9,5,100,52,40,35,16,2,2,11,5,107,57,42,27,15,1,3);
+INSERT INTO "match" VALUES(886,10,'2025-05-26',111,'O','P09Z','BT72','6-4 7-6(11) 7-6(5)','R32',NULL,13,1,118,78,61,22,17,5,7,5,4,134,102,71,13,17,8,11);
+INSERT INTO "match" VALUES(887,10,'2025-05-26',112,'O','AE14','M0JF','4-6 6-3 6-3 6-2','R32',NULL,18,4,104,64,49,24,18,2,4,4,6,128,72,45,23,18,12,18);
+INSERT INTO "match" VALUES(888,10,'2025-05-26',113,'O','S0AG','RE44','6-1 6-3 6-4','R16',NULL,5,0,68,42,34,20,13,3,3,7,1,89,58,40,9,13,3,8);
+INSERT INTO "match" VALUES(889,10,'2025-05-26',114,'O','Z355','GJ37','6-4 3-0 RET','R16',NULL,3,1,34,26,19,5,6,1,2,0,0,38,29,14,4,7,1,5);
+INSERT INTO "match" VALUES(890,10,'2025-05-26',115,'O','BK92','D0CO','5-7 6-3 6-2 6-4','R16',NULL,8,7,129,77,62,23,20,6,8,12,4,106,73,52,14,19,1,6);
+INSERT INTO "match" VALUES(891,10,'2025-05-26',116,'O','D643','N771','6-2 6-3 6-2','R16',NULL,4,3,90,54,39,17,13,3,5,2,1,69,40,18,12,12,4,11);
+INSERT INTO "match" VALUES(892,10,'2025-05-26',117,'O','A0E2','S0S1','7-6(8) 6-3 4-6 6-4','R16',NULL,5,2,142,99,67,29,21,7,9,6,3,129,88,61,24,20,4,7);
+INSERT INTO "match" VALUES(893,10,'2025-05-26',118,'O','M0EJ','R0DG','7-5 3-6 6-3 6-2','R16',NULL,4,1,124,79,53,25,19,2,5,1,3,120,75,43,26,19,3,9);
+INSERT INTO "match" VALUES(894,10,'2025-05-26',119,'O','PL56','P09Z','6-3 6-3 6-3','R16',NULL,1,1,88,55,38,24,14,9,10,5,3,72,43,31,10,13,1,6);
+INSERT INTO "match" VALUES(895,10,'2025-05-26',120,'O','TD51','AE14','6-3 6-4 7-6(4)','R16',NULL,6,0,96,65,47,18,16,0,3,8,3,99,56,40,15,15,3,8);
+INSERT INTO "match" VALUES(896,10,'2025-05-26',121,'O','S0AG','BK92','6-1 7-5 6-0','QF',NULL,5,1,77,48,37,20,13,2,2,5,6,89,60,39,6,12,8,14);
+INSERT INTO "match" VALUES(897,10,'2025-05-26',122,'O','D643','Z355','4-6 6-3 6-2 6-4','QF',NULL,6,0,119,85,65,19,19,2,3,4,1,103,72,55,11,18,4,8);
+INSERT INTO "match" VALUES(898,10,'2025-05-26',123,'O','A0E2','PL56','6-0 6-1 6-4','QF',NULL,3,0,55,44,39,9,12,0,0,3,2,87,64,35,9,11,11,17);
+INSERT INTO "match" VALUES(899,10,'2025-05-26',124,'O','M0EJ','TD51','6-2 4-6 7-5 6-2','QF',NULL,8,3,108,76,62,15,19,2,3,4,0,114,68,43,25,19,6,11);
+INSERT INTO "match" VALUES(900,10,'2025-05-26',125,'O','S0AG','D643','6-4 7-5 7-6(3)','SF',NULL,10,1,111,57,45,34,17,5,6,4,1,114,81,54,19,17,6,9);
+INSERT INTO "match" VALUES(901,10,'2025-05-26',126,'O','A0E2','M0EJ','4-6 7-6(3) 6-0 2-0 RET','SF',NULL,1,2,81,47,34,22,15,0,3,2,3,102,69,39,15,15,6,12);
+INSERT INTO "match" VALUES(902,10,'2025-05-26',127,'O','A0E2','S0AG','4-6 6-7(4) 6-4 7-6(3) 7-6(2)','F',329,7,7,194,113,71,46,28,8,15,8,0,191,103,72,44,28,7,14);
+INSERT INTO "match" VALUES(903,11,'2025-06-30',1,'O','S0AG','N0BG','6-4 6-3 6-0','R128',108,9,2,65,38,34,19,13,0,0,3,5,88,48,28,17,12,8,13);
+INSERT INTO "match" VALUES(904,11,'2025-06-30',2,'O','D0CO','B0BI','6-2 6-2 2-1 RET','R128',74,10,1,41,27,25,11,9,0,0,1,3,63,42,25,9,10,0,5);
+INSERT INTO "match" VALUES(905,11,'2025-06-30',3,'O','D643','MP20','6-1 6-7(7) 6-2 6-2','R128',199,22,1,103,72,59,19,17,3,3,8,7,172,111,67,25,18,20,27);
+INSERT INTO "match" VALUES(906,11,'2025-06-30',4,'O','BG23','M0EJ','6-2 4-6 7-5 6-1','R128',145,15,4,111,52,43,35,19,4,5,6,5,107,63,39,27,18,6,11);
+INSERT INTO "match" VALUES(907,11,'2025-06-30',5,'O','S0S1','BI81','6-4 7-6(1) 7-6(4)','R128',149,15,6,108,72,59,19,17,1,2,7,5,115,78,56,19,17,5,7);
+INSERT INTO "match" VALUES(908,11,'2025-06-30',6,'O','DH58','CF59','6-2 6-2 7-6(2)','R128',145,8,3,88,41,33,28,14,4,5,4,4,95,52,34,17,14,5,10);
+INSERT INTO "match" VALUES(909,11,'2025-06-30',7,'O','PL56','M0ON','6-4 6-4 6-2','R128',103,9,3,72,46,40,17,14,2,2,7,2,82,48,35,17,14,2,6);
+INSERT INTO "match" VALUES(910,11,'2025-06-30',8,'O','M0NI','G09O','6-1 4-6 6-2 6-2','R128',125,20,4,91,56,50,18,17,1,2,6,1,102,57,34,24,16,6,12);
+INSERT INTO "match" VALUES(911,11,'2025-06-30',9,'O','MC65','HH26','6-4 3-6 6-7(5) 7-5 6-2','R128',237,28,15,161,91,70,35,25,7,11,10,6,170,108,76,31,26,6,13);
+INSERT INTO "match" VALUES(912,11,'2025-06-30',10,'O','D875','N732','6-2 6-3 6-4','R128',99,26,3,67,49,47,9,14,0,0,1,1,87,54,35,16,13,4,8);
+INSERT INTO "match" VALUES(913,11,'2025-06-30',11,'O','M0FH','D923','6-3 6-2 6-4','R128',100,7,1,73,50,39,16,14,2,3,1,2,83,48,29,16,13,3,8);
+INSERT INTO "match" VALUES(914,11,'2025-06-30',12,'O','C0E9','Z09Z','6-3 7-6(7) 6-1','R128',106,11,3,85,57,46,21,15,2,2,14,6,89,56,42,15,13,5,8);
+INSERT INTO "match" VALUES(915,11,'2025-06-30',13,'O','N0BS','SU55','3-6 6-4 6-1 6-4','R128',148,1,5,104,62,43,27,18,4,7,6,11,111,60,43,21,18,4,10);
+INSERT INTO "match" VALUES(916,11,'2025-06-30',14,'O','MU94','BK92','6-4 3-6 4-6 7-6(5) 6-2','R128',204,8,6,151,88,63,34,24,7,12,21,8,148,86,65,28,25,3,9);
+INSERT INTO "match" VALUES(917,11,'2025-06-30',15,'O','N0AE','Y09V','6-4 4-6 7-6(1) 6-4','R128',214,21,3,131,88,67,23,21,7,9,14,4,148,92,65,24,21,5,8);
+INSERT INTO "match" VALUES(918,11,'2025-06-30',16,'O','KI95','M0QI','6-2 3-6 6-3 3-6 7-6(6)','R128',193,10,6,147,99,77,25,23,3,5,12,9,151,96,69,30,24,3,6);
+INSERT INTO "match" VALUES(919,11,'2025-06-30',17,'O','C0H0','W09E','6-3 7-6(6) 4-6 6-7(5) 6-1','R128',254,24,8,163,116,98,17,25,6,7,12,2,176,111,73,40,25,13,17);
+INSERT INTO "match" VALUES(920,11,'2025-06-30',18,'O','C977','C0JP','6-3 6-4 6-3','R128',108,16,0,75,44,37,18,14,3,4,12,9,85,57,39,11,14,8,13);
+INSERT INTO "match" VALUES(921,11,'2025-06-30',19,'O','D0C1','E865','6-3 6-7(5) 6-7(7) 6-3 7-6(3)','R128',269,32,15,188,106,84,48,27,12,12,17,7,193,135,99,26,27,8,11);
+INSERT INTO "match" VALUES(922,11,'2025-06-30',20,'O','E687','CI14','6-1 7-5 6-2','R128',134,6,0,82,46,37,22,14,2,3,6,6,82,47,33,12,13,1,7);
+INSERT INTO "match" VALUES(923,11,'2025-06-30',21,'O','F724','K0AZ','6-3 6-7(5) 6-1 5-7 6-4','R128',217,18,7,161,101,84,32,26,8,10,6,4,146,85,64,31,24,5,10);
+INSERT INTO "match" VALUES(924,11,'2025-06-30',22,'O','GC88','U182','7-6(6) 7-6(4) 6-3','R128',159,12,0,108,70,51,22,17,4,7,6,2,124,63,39,31,16,8,12);
+INSERT INTO "match" VALUES(925,11,'2025-06-30',23,'O','H0BH','GB88','6-3 6-1 6-1','R128',76,6,0,65,38,31,20,12,2,2,3,5,63,31,20,11,11,5,11);
+INSERT INTO "match" VALUES(926,11,'2025-06-30',24,'O','H09N','HB64','7-6(4) 6-3 6-4','R128',107,20,6,106,66,56,23,16,4,4,17,7,80,49,42,18,15,2,4);
+INSERT INTO "match" VALUES(927,11,'2025-06-30',25,'O','M0CI','M0OQ','6-1 6-4 6-3','R128',118,3,3,83,54,40,18,13,3,3,8,4,93,64,41,10,13,6,11);
+INSERT INTO "match" VALUES(928,11,'2025-06-30',26,'O','MO44','L0CF','2-6 6-2 6-4 6-2','R128',159,0,4,99,70,41,17,17,6,12,16,5,95,47,30,17,17,5,14);
+INSERT INTO "match" VALUES(929,11,'2025-06-30',27,'O','MW02','C0DF','6-4 6-4 6-2','R128',136,6,7,87,52,44,16,14,4,5,8,10,98,58,38,16,14,11,16);
+INSERT INTO "match" VALUES(930,11,'2025-06-30',28,'O','O513','M0JF','7-6(8) 3-1 RET','R128',87,9,1,50,30,27,14,8,1,1,7,1,65,47,32,10,8,4,5);
+INSERT INTO "match" VALUES(931,11,'2025-06-30',29,'O','O522','S0H2','6-3 7-5 7-6(4)','R128',115,19,7,106,64,49,25,17,5,7,11,6,93,57,47,12,16,3,7);
+INSERT INTO "match" VALUES(932,11,'2025-06-30',30,'O','P0HT','EA24','7-6(4) 6-3 7-5','R128',156,11,5,108,62,51,24,17,7,8,11,4,104,65,51,18,16,10,13);
+INSERT INTO "match" VALUES(933,11,'2025-06-30',31,'O','SU87','F0F2','6-3 6-4 6-2','R128',103,15,0,74,60,48,10,14,2,2,4,6,85,58,41,8,13,5,9);
+INSERT INTO "match" VALUES(934,11,'2025-06-30',32,'O','V832','T0AP','6-3 6-4 4-6 7-6(5)','R128',184,11,3,126,67,54,30,21,3,7,12,9,144,85,61,23,20,9,14);
+INSERT INTO "match" VALUES(935,11,'2025-06-30',33,'O','A0E2','F510','7-5 6-7(5) 7-5 2-6 6-1','R128',277,14,9,189,110,77,41,26,16,21,1,9,168,107,68,34,25,8,15);
+INSERT INTO "match" VALUES(936,11,'2025-06-30',34,'O','RC91','Z355','7-6(3) 6-7(8) 6-3 6-7(5) 6-4','R128',280,25,3,174,124,98,32,27,9,9,31,5,189,144,110,24,28,9,12);
+INSERT INTO "match" VALUES(937,11,'2025-06-30',35,'O','FB98','M0GZ','6-7(6) 6-7(8) 6-4 7-6(6) 6-4','R128',205,29,2,160,108,92,37,28,0,0,37,13,185,123,101,31,28,4,6);
+INSERT INTO "match" VALUES(938,11,'2025-06-30',36,'O','J551','R0DG','4-6 4-6 7-5 6-3 6-4','R128',214,31,8,139,84,66,35,26,3,6,7,9,150,90,70,28,25,7,11);
+INSERT INTO "match" VALUES(939,11,'2025-06-30',37,'O','BM95','MM58','7-6(2) 3-6 7-6(3) 6-2','R128',187,5,1,119,77,60,29,20,5,7,14,12,146,86,65,26,21,1,4);
+INSERT INTO "match" VALUES(940,11,'2025-06-30',38,'O','TD51','M0K4','6-3 6-4 6-2','R128',105,7,4,78,42,37,19,14,1,2,2,13,82,34,24,24,13,6,11);
+INSERT INTO "match" VALUES(941,11,'2025-06-30',39,'O','RE44','DB63','6-0 7-6(5) 6-7(9) 7-6(6)','R128',195,12,3,142,88,68,37,21,3,3,13,12,163,85,70,35,21,12,15);
+INSERT INTO "match" VALUES(942,11,'2025-06-30',40,'O','BT72','C0AU','4-6 6-3 7-6(5) 6-0','R128',148,9,0,113,77,58,23,19,7,10,5,4,116,81,54,14,18,8,14);
+INSERT INTO "match" VALUES(943,11,'2025-06-30',41,'O','KE29','MK66','7-5 6-4 6-4','R128',131,11,1,106,66,51,24,16,6,7,7,2,92,62,42,15,16,6,10);
+INSERT INTO "match" VALUES(944,11,'2025-06-30',42,'O','F0DM','P09Z','6-4 6-1 4-6 6-4','R128',169,6,3,114,67,45,32,18,2,3,20,5,124,72,50,25,19,11,16);
+INSERT INTO "match" VALUES(945,11,'2025-06-30',43,'O','L0BV','DA31','4-6 6-2 6-2 7-6(0)','R128',145,22,3,102,67,56,23,19,1,2,6,2,114,78,51,19,19,4,8);
+INSERT INTO "match" VALUES(946,11,'2025-06-30',44,'O','R0EB','TE51','6-3 6-2 RET','R128',77,8,1,50,34,27,10,9,3,3,7,7,60,26,16,18,8,1,4);
+INSERT INTO "match" VALUES(947,11,'2025-06-30',45,'O','AG37','D994','6-2 3-6 6-7(2) 6-4 6-4','R128',222,26,11,136,76,65,29,24,2,4,8,7,171,100,66,39,25,10,15);
+INSERT INTO "match" VALUES(948,11,'2025-06-30',46,'O','DH50','H09P','6-2 6-4 7-5','R128',108,11,3,84,55,44,17,15,2,3,8,1,87,56,39,11,15,4,9);
+INSERT INTO "match" VALUES(949,11,'2025-06-30',47,'O','B0CD','GJ37','6-2 7-5 6-3','R128',138,6,3,100,65,48,17,15,4,5,9,10,109,58,41,18,14,13,18);
+INSERT INTO "match" VALUES(950,11,'2025-06-30',48,'O','MQ75','BK40','4-6 6-2 6-4 5-7 6-3','R128',187,5,3,134,76,56,36,25,4,8,25,4,136,86,65,22,24,9,15);
+INSERT INTO "match" VALUES(951,11,'2025-06-30',49,'O','B0GG','C0AK','6-7(2) 6-3 6-4 6-4','R128',178,21,6,110,62,57,30,21,0,0,5,3,131,71,51,34,20,7,10);
+INSERT INTO "match" VALUES(952,11,'2025-06-30',50,'O','D0FJ','SX50','7-6(3) 1-6 6-7(2) 6-3 6-1','R128',228,9,4,148,90,63,31,24,5,10,17,7,166,95,64,37,23,11,17);
+INSERT INTO "match" VALUES(953,11,'2025-06-30',51,'O','D0F6','AE14','6-1 6-2 6-4','R128',101,7,1,74,43,33,21,13,4,5,5,3,71,35,21,16,12,6,12);
+INSERT INTO "match" VALUES(954,11,'2025-06-30',52,'O','F0FV','F0BY','6-4 6-1 7-6(5)','R128',121,11,4,90,64,54,13,15,4,4,4,10,96,63,41,17,14,8,11);
+INSERT INTO "match" VALUES(955,11,'2025-06-30',53,'O','GD64','R0E0','7-6(8) 6-4 6-4','R128',133,6,2,96,67,56,19,16,3,3,7,5,104,72,56,15,16,3,5);
+INSERT INTO "match" VALUES(956,11,'2025-06-30',54,'O','HD68','L987','6-3 6-2 6-4','R128',112,8,0,93,66,45,17,14,7,8,3,2,75,40,23,20,13,2,7);
+INSERT INTO "match" VALUES(957,11,'2025-06-30',55,'O','HG86','BU13','7-6(7) 7-6(2) 6-7(5) 6-2','R128',246,23,4,173,107,78,36,22,12,14,9,17,163,81,60,41,22,9,13);
+INSERT INTO "match" VALUES(958,11,'2025-06-30',56,'O','ME82','O483','6-2 6-4 6-3','R128',136,3,0,72,42,35,17,13,3,4,4,4,103,55,36,18,14,11,17);
+INSERT INTO "match" VALUES(959,11,'2025-06-30',57,'O','M0HU','Z0A1','2-6 3-6 6-3 7-6(6) 7-5','R128',194,5,5,170,100,75,36,25,9,14,22,7,140,79,63,34,25,4,8);
+INSERT INTO "match" VALUES(960,11,'2025-06-30',58,'O','N771','BD06','6-3 3-6 6-4 7-6(3)','R128',184,18,5,143,100,71,19,20,8,11,6,2,113,83,57,19,20,3,7);
+INSERT INTO "match" VALUES(961,11,'2025-06-30',59,'O','Q02L','S0TX','4-6 6-2 7-6(11) 6-2','R128',160,13,5,124,76,56,27,19,8,12,7,6,120,68,42,26,19,1,8);
+INSERT INTO "match" VALUES(962,11,'2025-06-30',60,'O','SL28','M0JZ','6-2 5-7 6-3 6-3','R128',126,18,6,103,56,46,30,19,0,1,7,9,127,80,53,22,19,7,12);
+INSERT INTO "match" VALUES(963,11,'2025-06-30',61,'O','T0GR','R0FS','6-4 6-4 6-4','R128',138,7,1,78,47,43,19,15,0,0,3,5,95,62,41,16,15,4,7);
+INSERT INTO "match" VALUES(964,11,'2025-06-30',62,'O','TC61','KI82','3-6 4-6 6-3 7-6(1) 6-1','R128',217,20,2,158,98,72,35,24,14,16,15,10,149,76,59,38,23,13,16);
+INSERT INTO "match" VALUES(965,11,'2025-06-30',63,'O','T0HA','B0NN','7-6(5) 6-3 6-2','R128',130,8,5,95,56,44,26,15,5,6,3,2,93,57,39,16,14,7,11);
+INSERT INTO "match" VALUES(966,11,'2025-06-30',64,'O','V812','A0FC','7-6(4) 7-6(5) 6-4','R128',179,7,4,121,73,58,29,17,5,6,8,7,136,68,53,35,17,5,7);
+INSERT INTO "match" VALUES(967,11,'2025-06-30',65,'O','S0AG','V832','6-1 6-1 6-3','R64',100,12,0,80,51,35,22,11,4,4,3,2,65,38,20,10,11,3,9);
+INSERT INTO "match" VALUES(968,11,'2025-06-30',66,'O','C977','D0CO','6-4 6-3 1-6 6-4','R64',159,16,6,104,59,46,27,18,5,7,14,0,109,68,50,19,18,6,9);
+INSERT INTO "match" VALUES(969,11,'2025-06-30',67,'O','D643','E687','6-3 6-2 6-0','R64',107,11,2,58,45,40,9,12,2,2,5,3,91,59,34,9,11,10,16);
+INSERT INTO "match" VALUES(970,11,'2025-06-30',68,'O','S0S1','H0BH','6-2 7-5 6-4','R64',132,11,4,93,52,39,29,15,3,3,2,2,98,68,42,16,15,8,12);
+INSERT INTO "match" VALUES(971,11,'2025-06-30',69,'O','DH58','C0H0','4-6 6-2 6-4 6-0','R64',168,2,2,97,57,42,25,17,2,4,11,4,120,65,42,22,17,13,20);
+INSERT INTO "match" VALUES(972,11,'2025-06-30',70,'O','O513','PL56','1-6 7-5 6-4 7-5','R64',175,9,7,142,67,51,37,21,10,14,5,3,113,60,43,30,20,0,4);
+INSERT INTO "match" VALUES(973,11,'2025-06-30',71,'O','M0NI','GC88','6-4 3-6 6-4 7-6(4)','R64',171,26,6,129,80,64,20,20,9,12,5,3,129,96,64,17,21,4,8);
+INSERT INTO "match" VALUES(974,11,'2025-06-30',72,'O','D875','MW02','7-5 4-6 7-5 7-5','R64',218,11,7,138,79,58,33,23,5,9,11,4,149,103,66,22,23,8,14);
+INSERT INTO "match" VALUES(975,11,'2025-06-30',73,'O','H09N','M0FH','7-6(5) 6-7(8) 6-7(5) 7-5 7-6(5)','R64',279,35,12,204,109,96,49,30,9,10,19,9,205,139,100,41,30,5,7);
+INSERT INTO "match" VALUES(976,11,'2025-06-30',74,'O','C0E9','P0HT','6-1 7-6(6) 6-2','R64',115,2,4,96,54,35,29,13,2,3,4,4,90,55,33,13,14,3,9);
+INSERT INTO "match" VALUES(977,11,'2025-06-30',75,'O','N0AE','O522','7-5 6-2 6-7(6) 6-3','R64',146,12,0,112,86,71,18,21,2,2,24,5,130,78,59,24,20,6,10);
+INSERT INTO "match" VALUES(978,11,'2025-06-30',76,'O','F724','MC65','6-4 1-6 4-6 7-6(5) 6-4','R64',223,1,10,175,109,71,29,24,10,16,3,3,161,102,68,28,25,5,10);
+INSERT INTO "match" VALUES(979,11,'2025-06-30',77,'O','KI95','D0C1','1-6 6-3 6-2 6-4','R64',133,5,1,88,55,43,22,17,2,4,16,5,112,55,42,25,17,4,8);
+INSERT INTO "match" VALUES(980,11,'2025-06-30',78,'O','MO44','N0BS','7-5 7-5 7-6(6)','R64',196,0,5,129,85,55,24,18,7,10,5,3,109,67,49,17,18,5,10);
+INSERT INTO "match" VALUES(981,11,'2025-06-30',79,'O','MU94','M0CI','6-2 6-3 7-6(9)','R64',137,6,4,104,77,56,15,14,2,3,3,3,101,72,43,16,15,4,9);
+INSERT INTO "match" VALUES(982,11,'2025-06-30',80,'O','SU87','BG23','6-1 6-3 6-7(3) 7-6(4)','R64',181,10,0,120,79,60,26,20,2,4,5,9,131,76,57,22,20,6,12);
+INSERT INTO "match" VALUES(983,11,'2025-06-30',81,'O','A0E2','T0GR','6-1 6-4 6-4','R64',137,3,4,96,62,43,18,14,9,11,1,1,77,47,25,13,13,4,10);
+INSERT INTO "match" VALUES(984,11,'2025-06-30',82,'O','FB98','D0F6','3-6 6-3 7-6(0) 4-6 6-3','R64',186,27,4,133,88,70,30,25,3,6,26,8,162,120,92,13,24,8,11);
+INSERT INTO "match" VALUES(985,11,'2025-06-30',83,'O','N771','TD51','4-6 6-4 6-3 7-5','R64',176,17,3,120,91,69,14,21,6,9,20,4,138,71,50,32,20,8,13);
+INSERT INTO "match" VALUES(986,11,'2025-06-30',84,'O','RE44','HG86','6-7(1) 6-4 7-6(5) 6-3','R64',165,12,6,119,81,71,22,22,3,4,25,0,130,88,67,20,21,3,6);
+INSERT INTO "match" VALUES(987,11,'2025-06-30',85,'O','KE29','M0HU','1-6 7-6(7) 4-6 6-3 6-4','R64',219,10,3,176,111,70,33,25,12,20,6,3,149,79,55,38,23,10,16);
+INSERT INTO "match" VALUES(988,11,'2025-06-30',86,'O','B0GG','L0BV','7-6(4) 6-1 7-5','R64',127,11,5,101,60,50,22,16,6,7,8,2,86,50,35,19,15,0,4);
+INSERT INTO "match" VALUES(989,11,'2025-06-30',87,'O','SL28','AG37','3-6 7-6(9) 6-3 6-4','R64',191,10,4,133,70,50,34,19,10,13,16,8,148,92,62,27,21,9,14);
+INSERT INTO "match" VALUES(990,11,'2025-06-30',88,'O','DH50','V812','6-1 4-6 6-3 7-6(5)','R64',187,3,1,125,86,58,25,19,8,11,6,6,137,93,61,15,19,9,15);
+INSERT INTO "match" VALUES(991,11,'2025-06-30',89,'O','BT72','HD68','6-3 6-4 7-6(7)','R64',150,11,3,114,77,62,18,16,8,8,7,2,112,81,53,14,15,4,6);
+INSERT INTO "match" VALUES(992,11,'2025-06-30',90,'O','D0FJ','F0DM','6-4 6-3 6-3','R64',141,7,2,102,60,44,18,14,11,13,6,2,106,62,35,21,14,13,19);
+INSERT INTO "match" VALUES(993,11,'2025-06-30',91,'O','F0FV','B0CD','6-4 5-7 6-2 6-4','R64',193,8,4,128,86,59,22,20,10,13,6,2,144,95,57,26,20,11,17);
+INSERT INTO "match" VALUES(994,11,'2025-06-30',92,'O','J551','T0HA','6-2 6-2 6-3','R64',98,9,2,63,51,44,8,13,0,0,6,5,86,52,33,12,12,5,10);
+INSERT INTO "match" VALUES(995,11,'2025-06-30',93,'O','MQ75','Q02L','6-1 6-4 6-3','R64',94,5,0,80,51,35,20,13,4,5,8,4,77,56,35,5,13,3,9);
+INSERT INTO "match" VALUES(996,11,'2025-06-30',94,'O','ME82','R0EB','6-4 6-4 5-7 7-6(1)','R64',203,18,2,129,78,67,29,22,3,4,12,4,146,93,63,31,22,9,11);
+INSERT INTO "match" VALUES(997,11,'2025-06-30',95,'O','RC91','GD64','3-6 6-3 7-6(3) 4-6 6-3','R64',227,14,6,159,99,70,35,25,5,8,10,1,154,109,73,29,24,10,13);
+INSERT INTO "match" VALUES(998,11,'2025-06-30',96,'O','TC61','BM95','7-5 6-7(2) 4-6 6-2 6-4','R64',231,20,6,170,96,72,37,26,6,8,13,3,173,112,75,32,26,9,14);
+INSERT INTO "match" VALUES(999,11,'2025-06-30',97,'O','S0AG','MO44','6-1 6-3 6-1','R32',115,11,3,74,43,34,19,12,4,4,0,0,79,60,32,7,11,8,14);
+INSERT INTO "match" VALUES(1000,11,'2025-06-30',98,'O','D643','KI95','6-3 6-0 6-4','R32',107,16,3,69,49,40,12,13,0,1,3,1,89,58,33,12,12,4,10);
+INSERT INTO "match" VALUES(1001,11,'2025-06-30',99,'O','S0S1','F724','6-3 7-6(4) 6-2','R32',120,9,0,91,67,54,12,15,3,4,7,2,86,56,39,14,14,3,7);
+INSERT INTO "match" VALUES(1002,11,'2025-06-30',100,'O','DH58','H09N','6-4 7-6(5) 6-3','R32',141,3,1,93,52,44,26,16,4,5,6,5,111,72,53,17,15,9,12);
+INSERT INTO "match" VALUES(1003,11,'2025-06-30',101,'O','C0E9','M0NI','6-2 6-4 6-2','R32',108,9,1,79,43,32,25,13,1,1,11,7,93,54,35,15,13,12,17);
+INSERT INTO "match" VALUES(1004,11,'2025-06-30',102,'O','D875','O513','6-3 6-4 7-6(0)','R32',145,15,7,97,57,46,24,16,2,3,7,4,91,49,33,24,15,3,6);
+INSERT INTO "match" VALUES(1005,11,'2025-06-30',103,'O','SU87','N0AE','6-7(5) 7-6(8) 7-6(2) 3-6 7-6(3)','R32',304,16,1,188,143,101,30,28,7,10,16,1,199,145,106,32,29,10,12);
+INSERT INTO "match" VALUES(1006,11,'2025-06-30',104,'O','C977','MU94','6-3 3-6 6-2 6-4','R32',186,14,1,134,83,61,22,18,6,8,6,6,102,63,48,17,18,3,8);
+INSERT INTO "match" VALUES(1007,11,'2025-06-30',105,'O','A0E2','SL28','6-1 3-6 6-3 6-4','R32',145,10,4,108,63,46,28,18,3,5,13,10,122,67,50,21,17,7,12);
+INSERT INTO "match" VALUES(1008,11,'2025-06-30',106,'O','FB98','DH50','6-4 6-3 6-7(5) 6-1','R32',192,17,1,120,78,61,23,18,7,8,5,3,130,96,58,18,20,8,15);
+INSERT INTO "match" VALUES(1009,11,'2025-06-30',107,'O','RE44','ME82','7-5 6-2 6-3','R32',119,14,4,99,56,45,23,15,9,10,8,1,79,56,37,11,14,3,8);
+INSERT INTO "match" VALUES(1010,11,'2025-06-30',108,'O','KE29','BT72','7-6(6) 4-6 4-6 6-3 7-6(8)','R32',228,11,6,171,113,82,35,27,8,13,9,4,169,122,92,21,26,8,12);
+INSERT INTO "match" VALUES(1011,11,'2025-06-30',109,'O','J551','F0FV','6-3 6-4 3-6 7-6(4)','R32',188,25,7,133,89,70,24,20,10,11,8,2,132,95,67,20,20,5,7);
+INSERT INTO "match" VALUES(1012,11,'2025-06-30',110,'O','MQ75','RC91','6-3 7-6(4) 7-6(6)','R32',166,9,1,119,80,55,26,17,4,5,19,6,113,66,51,21,16,7,9);
+INSERT INTO "match" VALUES(1013,11,'2025-06-30',111,'O','N771','B0GG','7-6(5) 6-4 6-3','R32',148,6,2,103,66,43,23,15,8,11,7,8,108,53,33,28,16,6,12);
+INSERT INTO "match" VALUES(1014,11,'2025-06-30',112,'O','TC61','D0FJ','6-4 6-4 3-6 6-3','R32',174,19,0,126,79,60,27,19,7,8,8,4,117,81,54,23,19,7,10);
+INSERT INTO "match" VALUES(1015,11,'2025-06-30',113,'O','S0AG','D875','3-6 5-7 2-2 RET','R16',128,3,3,59,34,28,11,12,2,5,14,3,85,49,41,18,13,1,2);
+INSERT INTO "match" VALUES(1016,11,'2025-06-30',114,'O','D643','DH58','1-6 6-4 6-4 6-4','R16',199,6,5,129,85,59,18,19,13,19,1,4,113,62,35,29,18,7,13);
+INSERT INTO "match" VALUES(1017,11,'2025-06-30',115,'O','S0S1','SU87','3-6 6-1 7-6(1) 7-5','R16',185,8,5,126,76,56,31,20,4,6,8,3,118,82,59,17,20,2,6);
+INSERT INTO "match" VALUES(1018,11,'2025-06-30',116,'O','C0E9','C977','6-4 6-4 6-7(4) 7-6(3)','R16',205,11,3,150,92,72,33,22,7,8,19,1,143,93,66,30,22,5,8);
+INSERT INTO "match" VALUES(1019,11,'2025-06-30',117,'O','A0E2','RE44','6-7(5) 6-3 6-4 6-4','R16',164,22,3,116,78,64,24,21,3,4,6,4,123,82,59,23,20,7,11);
+INSERT INTO "match" VALUES(1020,11,'2025-06-30',118,'O','FB98','TC61','6-1 3-0 RET','R16',41,6,0,24,12,12,11,5,0,0,1,1,28,17,9,2,5,1,5);
+INSERT INTO "match" VALUES(1021,11,'2025-06-30',119,'O','KE29','MQ75','6-4 6-2 6-3','R16',107,10,0,70,52,41,12,13,3,4,6,0,90,61,42,9,14,4,10);
+INSERT INTO "match" VALUES(1022,11,'2025-06-30',120,'O','N771','J551','6-3 7-6(4) 6-7(7) 6-7(5) 6-3','R16',267,8,6,196,134,101,37,28,8,8,46,8,178,117,93,29,26,7,9);
+INSERT INTO "match" VALUES(1023,11,'2025-06-30',121,'O','S0AG','S0S1','7-6(2) 6-4 6-4','QF',139,7,1,86,56,50,20,16,2,2,14,6,101,60,48,17,16,3,5);
+INSERT INTO "match" VALUES(1024,11,'2025-06-30',122,'O','D643','C0E9','6-7(6) 6-2 7-5 6-4','QF',191,13,2,116,81,61,24,21,0,2,13,4,142,90,66,19,21,6,12);
+INSERT INTO "match" VALUES(1025,11,'2025-06-30',123,'O','A0E2','N771','6-2 6-3 6-3','QF',99,13,4,76,55,49,7,13,5,5,3,3,83,57,36,9,13,6,11);
+INSERT INTO "match" VALUES(1026,11,'2025-06-30',124,'O','FB98','KE29','6-3 6-4 1-6 7-6(4)','QF',156,16,2,105,67,54,22,19,1,4,6,3,119,66,48,28,19,5,8);
+INSERT INTO "match" VALUES(1027,11,'2025-06-30',125,'O','S0AG','D643','6-3 6-3 6-4','SF',115,12,2,73,54,44,12,14,1,2,12,0,92,62,48,5,14,5,10);
+INSERT INTO "match" VALUES(1028,11,'2025-06-30',126,'O','A0E2','FB98','6-4 5-7 6-3 7-6(6)','SF',169,13,3,113,73,64,23,21,1,2,19,6,121,75,60,26,22,4,7);
+INSERT INTO "match" VALUES(1029,11,'2025-06-30',127,'O','S0AG','A0E2','4-6 6-4 6-4 6-4','F',184,8,2,117,72,54,27,20,4,6,15,7,121,64,48,29,20,5,9);
+INSERT INTO "match" VALUES(1030,12,'2025-08-24',1,'O','DH50','S0H2','6-1 6-1 6-2','R128',129,6,2,66,37,29,17,11,4,4,1,2,62,29,17,10,11,2,9);
+INSERT INTO "match" VALUES(1031,12,'2025-08-24',2,'O','FB98','N0AM','7-5 6-2 6-3','R128',120,11,5,90,59,44,20,15,4,4,9,6,100,64,42,18,14,6,10);
+INSERT INTO "match" VALUES(1032,12,'2025-08-24',3,'O','S0S1','B0ID','6-3 6-2 6-4','R128',128,5,3,88,55,43,18,14,5,5,2,6,91,48,35,18,13,9,13);
+INSERT INTO "match" VALUES(1033,12,'2025-08-24',4,'O','M0NI','J551','7-6(5) 6-3 6-4','R128',147,16,3,106,57,46,23,16,8,10,13,5,97,63,43,15,15,5,9);
+INSERT INTO "match" VALUES(1034,12,'2025-08-24',5,'O','D0FJ','H0BH','6-2 6-1 6-2','R128',85,11,6,62,35,33,14,12,0,0,3,5,68,38,24,10,13,2,8);
+INSERT INTO "match" VALUES(1035,12,'2025-08-24',6,'O','RC91','CF59','7-6(2) 7-5 4-6 6-2','R128',234,14,6,128,122,89,0,21,5,6,4,5,151,146,93,0,21,10,13);
+INSERT INTO "match" VALUES(1036,12,'2025-08-24',7,'O','M0FH','N0BG','6-3 6-1 6-1','R128',83,10,0,58,43,34,11,11,2,2,1,10,72,35,22,14,12,7,14);
+INSERT INTO "match" VALUES(1037,12,'2025-08-24',8,'O','BV16','M0CI','6-4 3-6 7-6(7) 6-2','R128',170,10,7,130,76,55,28,19,3,6,8,6,126,81,54,26,20,4,9);
+INSERT INTO "match" VALUES(1038,12,'2025-08-24',9,'O','S0JA','D0D4','7-5 6-4 7-6(4)','R128',162,5,3,120,94,62,16,17,8,10,12,3,124,100,64,8,17,9,13);
+INSERT INTO "match" VALUES(1039,12,'2025-08-24',10,'O','L0BV','CG80','3-6 6-4 7-6(5) 6-1','R128',194,13,6,118,72,57,23,20,2,5,7,7,122,74,49,25,18,4,8);
+INSERT INTO "match" VALUES(1040,12,'2025-08-24',11,'O','ME82','GJ37','7-5 6-4 6-0','R128',147,14,3,86,46,41,21,14,8,9,14,10,99,58,40,11,14,10,16);
+INSERT INTO "match" VALUES(1041,12,'2025-08-24',12,'O','CD85','L0CX','7-6(7) 6-4 6-2','R128',147,12,8,119,78,56,16,15,11,14,4,1,98,66,48,23,15,5,5);
+INSERT INTO "match" VALUES(1042,12,'2025-08-24',13,'O','EA24','U182','6-3 6-2 6-0','R128',106,10,0,67,48,37,11,12,0,1,4,8,67,34,15,13,11,4,11);
+INSERT INTO "match" VALUES(1043,12,'2025-08-24',14,'O','S0K7','P09O','6-4 6-2 7-5','R128',125,14,1,85,54,39,12,15,3,8,5,6,88,51,27,12,15,5,14);
+INSERT INTO "match" VALUES(1044,12,'2025-08-24',15,'O','K0EP','Q02L','6-3 6-2 3-6 7-6(5)','R128',153,12,5,134,129,85,1,41,3,5,15,1,125,124,75,0,43,4,8);
+INSERT INTO "match" VALUES(1045,12,'2025-08-24',16,'O','TC61','MW02','6-2 6-4 1-6 6-3','R128',176,11,2,100,63,44,22,17,5,8,4,5,113,61,42,24,17,9,14);
+INSERT INTO "match" VALUES(1046,12,'2025-08-24',17,'O','D643','T0HA','6-1 7-6(3) 6-2','R128',144,7,4,94,56,43,18,14,6,8,1,7,89,58,32,10,13,3,9);
+INSERT INTO "match" VALUES(1047,12,'2025-08-24',18,'O','BM95','MM58','6-3 7-5 6-7(5) 0-6 6-4','R128',226,7,4,157,107,70,29,25,13,19,21,10,149,92,68,24,24,10,16);
+INSERT INTO "match" VALUES(1048,12,'2025-08-24',19,'O','N0AE','D0C1','6-2 6-7(5) 2-6 6-2 7-6(7)','R128',226,17,4,149,88,71,33,24,4,7,17,8,147,88,60,35,24,5,10);
+INSERT INTO "match" VALUES(1049,12,'2025-08-24',20,'O','GC88','N0BS','6-0 7-5 4-6 5-7 6-4','R128',255,2,5,172,103,66,37,25,11,17,4,11,156,101,60,25,25,7,16);
+INSERT INTO "match" VALUES(1050,12,'2025-08-24',21,'O','BU13','T0AP','6-3 6-4 6-3','R128',115,7,5,68,41,28,15,14,1,5,0,3,77,44,20,14,14,4,12);
+INSERT INTO "match" VALUES(1051,12,'2025-08-24',22,'O','D0DT','B0NO','6-3 6-4 6-4','R128',101,24,4,85,56,46,17,15,3,3,11,3,78,55,39,12,14,3,6);
+INSERT INTO "match" VALUES(1052,12,'2025-08-24',23,'O','HG86','B0BI','6-3 7-5 6-4','R128',136,9,5,89,84,59,1,16,4,7,3,2,96,94,50,15,0,5,11);
+INSERT INTO "match" VALUES(1053,12,'2025-08-24',24,'O','N771','K0AH','7-5 6-4 RET','R128',106,3,3,78,48,37,16,11,6,6,12,3,77,40,30,16,11,5,7);
+INSERT INTO "match" VALUES(1054,12,'2025-08-24',25,'O','W0BH','K0AZ','6-4 7-5 7-6(4)','R128',148,22,1,103,56,42,32,17,4,6,10,9,100,62,48,18,17,5,9);
+INSERT INTO "match" VALUES(1055,12,'2025-08-24',26,'O','W09E','HH26','6-4 7-6(4) 5-7 6-1','R128',175,15,5,118,69,61,29,21,2,3,19,8,132,74,58,29,20,3,6);
+INSERT INTO "match" VALUES(1056,12,'2025-08-24',27,'O','D0CO','GJ16','6-4 7-5 6-7(7) 6-2','R128',185,14,5,133,81,65,28,21,2,4,15,6,129,81,55,25,21,5,11);
+INSERT INTO "match" VALUES(1057,12,'2025-08-24',28,'O','C0DF','M0QI','1-6 6-3 6-4 6-4','R128',159,9,7,110,55,45,20,18,5,9,4,5,106,72,48,18,18,4,9);
+INSERT INTO "match" VALUES(1058,12,'2025-08-24',29,'O','C0JP','GE33','6-4 6-4 6-4','R128',140,6,5,95,58,42,23,15,5,6,8,6,106,59,42,21,15,7,11);
+INSERT INTO "match" VALUES(1059,12,'2025-08-24',30,'O','F0FV','KI95','7-6(3) 7-6(5) 6-3','R128',148,14,0,101,63,47,24,16,1,3,6,6,124,69,51,24,17,5,9);
+INSERT INTO "match" VALUES(1060,12,'2025-08-24',31,'O','TD51','N732','6-3 7-6(6) 6-3','R128',149,19,2,108,64,50,20,16,4,6,5,0,101,64,39,16,14,8,12);
+INSERT INTO "match" VALUES(1061,12,'2025-08-24',32,'O','C0E9','P0CT','7-5 4-6 6-4 3-6 6-3','R128',226,7,15,161,65,47,51,25,9,15,15,12,163,95,68,28,25,11,18);
+INSERT INTO "match" VALUES(1062,12,'2025-08-24',33,'O','B0GG','S0RE','7-6(0) 1-6 6-3 3-0 RET','R128',174,12,4,106,65,44,21,15,12,16,3,7,123,71,43,23,16,6,11);
+INSERT INTO "match" VALUES(1063,12,'2025-08-24',34,'O','MU94','F0F2','6-0 6-3 5-7 6-2','R128',166,5,7,117,83,59,13,18,5,9,3,5,95,49,31,17,17,4,13);
+INSERT INTO "match" VALUES(1064,12,'2025-08-24',35,'O','KE29','B0NN','6-7(5) 6-3 7-5 6-1','R128',192,19,6,125,76,61,25,20,8,10,3,5,129,68,44,31,20,1,8);
+INSERT INTO "match" VALUES(1065,12,'2025-08-24',36,'O','R0DG','V812','6-3 7-6(4) 7-6(2)','R128',182,9,7,121,66,45,32,17,2,5,6,11,110,64,45,18,16,5,9);
+INSERT INTO "match" VALUES(1066,12,'2025-08-24',37,'O','RE44','P0HW','6-4 6-4 6-4','R128',121,9,3,87,43,36,27,15,3,3,6,5,78,46,32,18,15,0,3);
+INSERT INTO "match" VALUES(1067,12,'2025-08-24',38,'O','B0EJ','D994','6-3 7-5 6-4','R128',124,3,3,87,42,34,24,16,0,3,4,8,92,50,35,15,15,6,12);
+INSERT INTO "match" VALUES(1068,12,'2025-08-24',39,'O','B0CD','V832','6-3 6-7(4) 6-4 3-6 6-4','R128',229,11,9,168,101,69,32,24,11,17,18,7,168,97,70,29,26,11,20);
+INSERT INTO "match" VALUES(1069,12,'2025-08-24',40,'O','MQ75','DA31','6-1 6-4 6-7(5) 6-4','R128',190,18,4,141,83,57,26,20,11,16,4,8,149,96,55,22,19,16,25);
+INSERT INTO "match" VALUES(1070,12,'2025-08-24',41,'O','SL28','MK66','3-6 7-6(4) 6-3 6-3','R128',174,18,14,130,64,57,26,19,4,7,8,12,132,71,49,27,20,3,8);
+INSERT INTO "match" VALUES(1071,12,'2025-08-24',42,'O','RH16','O513','6-1 6-2 7-6(5)','R128',116,9,2,90,50,41,24,14,4,4,12,5,89,45,36,17,13,1,5);
+INSERT INTO "match" VALUES(1072,12,'2025-08-24',43,'O','D0F6','D923','7-6(4) 4-6 7-5 7-5','R128',201,17,2,136,91,67,27,23,2,5,0,7,149,105,73,24,23,6,10);
+INSERT INTO "match" VALUES(1073,12,'2025-08-24',44,'O','A0E2','O522','6-4 7-5 6-4','R128',127,4,6,84,58,50,16,16,3,3,14,9,105,66,49,16,16,8,11);
+INSERT INTO "match" VALUES(1074,12,'2025-08-24',45,'O','S0AG','KI82','6-1 6-1 6-2','R128',100,7,1,68,40,33,15,11,2,2,4,8,63,32,19,8,11,3,10);
+INSERT INTO "match" VALUES(1075,12,'2025-08-24',46,'O','M0EJ','M0GZ','6-7(3) 6-3 6-4 6-4','R128',156,13,1,100,68,59,28,21,0,0,13,10,125,74,63,26,20,5,8);
+INSERT INTO "match" VALUES(1076,12,'2025-08-24',47,'O','C0AU','A0FC','3-6 2-6 7-5 6-4 6-3','R128',225,3,7,146,78,55,38,24,9,14,10,4,138,71,48,37,24,4,9);
+INSERT INTO "match" VALUES(1077,12,'2025-08-24',48,'O','BK92','C977','6-4 6-1 6-4','R128',114,16,4,79,44,42,16,14,2,2,5,2,78,42,31,15,13,5,9);
+INSERT INTO "match" VALUES(1078,12,'2025-08-24',49,'O','SU55','F724','6-4 6-4 6-0','R128',123,8,5,79,40,27,22,13,4,7,1,8,86,48,28,11,13,3,11);
+INSERT INTO "match" VALUES(1079,12,'2025-08-24',50,'O','GB88','HB64','6-7(2) 6-4 6-3 7-5','R128',195,6,11,149,72,46,41,22,10,16,13,17,159,81,56,32,21,13,22);
+INSERT INTO "match" VALUES(1080,12,'2025-08-24',51,'O','M0HU','G09O','6-4 6-3 6-4','R128',119,4,5,85,40,28,22,14,6,11,2,4,96,56,29,16,15,14,23);
+INSERT INTO "match" VALUES(1081,12,'2025-08-24',52,'O','P09Z','RH24','6-3 6-4 7-6(3)','R128',134,19,3,85,53,46,17,16,0,3,4,9,110,64,41,21,15,9,14);
+INSERT INTO "match" VALUES(1082,12,'2025-08-24',53,'O','R0FS','MO44','6-4 6-2 6-3','R128',130,15,4,83,55,44,15,13,8,8,0,10,101,53,34,21,14,10,15);
+INSERT INTO "match" VALUES(1083,12,'2025-08-24',54,'O','R0EB','Y09V','6-1 6-4 7-6(1)','R128',137,12,1,95,63,51,18,15,5,5,11,3,90,50,37,20,14,1,4);
+INSERT INTO "match" VALUES(1084,12,'2025-08-24',55,'O','AG37','HD68','6-4 7-6(8) 6-4','R128',177,10,5,107,72,53,17,16,7,10,0,2,110,69,45,20,16,3,8);
+INSERT INTO "match" VALUES(1085,12,'2025-08-24',56,'O','TE51','MP20','4-6 6-0 6-1 7-6(5)','R128',138,16,3,105,62,43,25,18,5,7,4,5,111,75,49,14,17,9,15);
+INSERT INTO "match" VALUES(1086,12,'2025-08-24',57,'O','AE14','M0JF','7-5 6-7(3) 7-6(7) 6-7(5) 6-4','R128',289,24,3,181,118,95,30,29,1,4,28,11,197,122,100,32,29,12,17);
+INSERT INTO "match" VALUES(1087,12,'2025-08-24',58,'O','BT72','H09P','6-4 6-2 6-3','R128',110,10,4,83,54,42,15,14,2,4,5,0,87,46,28,18,13,11,17);
+INSERT INTO "match" VALUES(1088,12,'2025-08-24',59,'O','SX50','MC65','6-4 2-6 6-1 3-6 6-4','R128',164,8,3,119,82,60,14,22,1,7,15,10,117,59,44,26,22,5,12);
+INSERT INTO "match" VALUES(1089,12,'2025-08-24',60,'O','S0N0','SU87','6-3 7-6(8) 1-6 1-6 7-6(6)','R128',261,10,11,159,91,69,34,24,8,14,20,9,177,107,78,38,23,12,14);
+INSERT INTO "match" VALUES(1090,12,'2025-08-24',61,'O','DH58','O483','6-3 6-4 6-4','R128',114,10,1,78,41,37,24,15,0,0,7,1,93,60,44,15,14,8,11);
+INSERT INTO "match" VALUES(1091,12,'2025-08-24',62,'O','Z355','TE30','6-2 7-6(4) 6-4','R128',129,9,3,100,67,54,20,15,6,6,8,2,86,54,43,16,15,2,5);
+INSERT INTO "match" VALUES(1092,12,'2025-08-24',63,'O','PL56','M0K4','6-3 6-3 6-1','R128',109,4,3,73,37,31,23,13,0,0,1,12,83,41,28,18,12,5,10);
+INSERT INTO "match" VALUES(1093,12,'2025-08-24',64,'O','F0BY','BD06','7-5 6-2 5-7 6-4','R128',206,20,18,148,74,63,32,21,11,15,2,9,133,84,52,22,21,5,12);
+INSERT INTO "match" VALUES(1094,12,'2025-08-24',65,'O','L0BV','EA24','3-6 6-0 6-2 6-4','R64',157,12,4,88,66,50,13,17,1,3,5,6,114,67,40,23,16,8,14);
+INSERT INTO "match" VALUES(1095,12,'2025-08-24',66,'O','BU13','D0CO','W/O','R64',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+INSERT INTO "match" VALUES(1096,12,'2025-08-24',67,'O','D643','S0K7','6-7(5) 6-3 6-3 6-1','R64',154,10,4,104,62,52,27,19,2,3,8,3,115,84,54,16,18,9,15);
+INSERT INTO "match" VALUES(1097,12,'2025-08-24',68,'O','M0FH','F0FV','7-6(4) 6-2 6-3','R64',121,3,2,93,59,47,21,15,4,4,9,4,79,55,40,14,14,3,6);
+INSERT INTO "match" VALUES(1098,12,'2025-08-24',69,'O','K0EP','N0AE','4-6 7-6(2) 7-5 3-6 7-6(8)','R64',265,28,5,171,114,81,31,27,6,11,22,9,198,130,97,32,28,10,14);
+INSERT INTO "match" VALUES(1099,12,'2025-08-24',70,'O','FB98','HG86','4-6 7-6(3) 6-2 6-4','R64',203,17,3,135,85,64,24,20,5,8,10,6,147,80,57,27,20,9,14);
+INSERT INTO "match" VALUES(1100,12,'2025-08-24',71,'O','C0JP','RH16','6-4 3-6 3-6 6-4 7-5','R64',214,18,17,161,98,68,26,25,7,13,12,3,140,83,61,29,25,7,13);
+INSERT INTO "match" VALUES(1101,12,'2025-08-24',72,'O','BM95','GC88','2-6 4-6 7-5 6-3 6-4','R64',223,12,7,166,144,92,9,25,10,15,7,3,154,140,88,8,24,10,15);
+INSERT INTO "match" VALUES(1102,12,'2025-08-24',73,'O','TD51','D0DT','6-4 7-5 6-7(8) 7-5','R64',179,13,1,123,81,69,31,23,3,3,27,7,142,89,69,31,23,6,9);
+INSERT INTO "match" VALUES(1103,12,'2025-08-24',74,'O','RC91','DH50','6-4 3-6 2-6 6-2 6-3','R64',196,8,9,132,82,58,24,22,7,12,6,5,130,83,58,25,22,7,13);
+INSERT INTO "match" VALUES(1104,12,'2025-08-24',75,'O','N771','C0DF','7-6(5) 6-3 6-7(0) 7-6(4)','R64',243,8,6,165,124,78,19,22,14,20,16,12,170,117,71,24,23,12,20);
+INSERT INTO "match" VALUES(1105,12,'2025-08-24',76,'O','BV16','M0NI','6-7(2) 7-6(5) 3-6 6-4 7-6(7)','R64',268,13,10,184,136,99,21,27,5,9,29,12,184,138,97,25,28,3,7);
+INSERT INTO "match" VALUES(1106,12,'2025-08-24',77,'O','D0FJ','S0JA','6-0 7-6(3) 2-6 6-4','R64',153,12,7,111,63,49,26,18,3,6,11,1,104,70,44,19,18,1,6);
+INSERT INTO "match" VALUES(1107,12,'2025-08-24',78,'O','S0S1','CD85','6-4 6-2 6-4','R64',119,8,2,78,52,38,14,14,2,4,14,2,85,58,34,10,0,1,7);
+INSERT INTO "match" VALUES(1108,12,'2025-08-24',79,'O','A0E2','B0GG','6-1 6-0 6-3','R64',98,7,2,58,35,30,15,11,0,0,2,2,83,52,22,17,11,10,17);
+INSERT INTO "match" VALUES(1109,12,'2025-08-24',80,'O','SL28','R0DG','7-6(5) 2-6 6-3 4-6 7-5','R64',208,28,5,159,93,74,33,26,4,8,13,5,159,105,83,24,25,6,9);
+INSERT INTO "match" VALUES(1110,12,'2025-08-24',81,'O','ME82','TC61','6-4 6-7(5) 6-3 6-3','R64',213,6,3,129,113,79,9,20,8,9,10,3,136,122,75,9,20,7,12);
+INSERT INTO "match" VALUES(1111,12,'2025-08-24',82,'O','M0EJ','GB88','6-4 6-0 6-2','R64',123,4,2,85,54,35,18,12,9,11,3,8,71,30,17,13,12,4,12);
+INSERT INTO "match" VALUES(1112,12,'2025-08-24',83,'O','RE44','B0EJ','6-3 6-3 5-7 7-6(4)','R64',178,21,5,132,83,66,23,21,4,7,7,6,133,72,51,32,21,6,11);
+INSERT INTO "match" VALUES(1113,12,'2025-08-24',84,'O','W0BH','W09E','7-6(5) 6-2 4-6 6-4','R64',182,21,5,130,71,53,30,20,11,16,7,6,136,78,49,26,20,8,15);
+INSERT INTO "match" VALUES(1114,12,'2025-08-24',85,'O','S0AG','P09Z','6-3 6-2 6-2','R64',123,6,4,82,45,35,22,13,5,5,6,4,75,45,27,10,12,4,9);
+INSERT INTO "match" VALUES(1115,12,'2025-08-24',86,'O','MQ75','KE29','2-6 6-7(4) 6-4 7-5 7-6(5)','R64',275,14,5,218,142,100,37,27,13,17,22,12,174,116,90,24,27,5,9);
+INSERT INTO "match" VALUES(1116,12,'2025-08-24',87,'O','R0FS','C0AU','3-6 4-6 6-4 6-4 6-2','R64',217,15,7,139,72,50,38,23,2,7,4,12,178,107,73,31,24,14,21);
+INSERT INTO "match" VALUES(1117,12,'2025-08-24',88,'O','C0E9','B0CD','5-7 6-3 6-4 2-6 7-6(3)','R64',192,4,8,204,113,69,53,26,16,22,5,6,154,92,69,29,25,9,14);
+INSERT INTO "match" VALUES(1118,12,'2025-08-24',89,'O','SU55','R0EB','7-6(6) 3-6 7-6(4) 6-3','R64',219,29,15,133,71,58,27,20,8,13,7,10,167,100,63,34,22,8,14);
+INSERT INTO "match" VALUES(1119,12,'2025-08-24',90,'O','BK92','S0N0','6-3 6-3 6-3','R64',105,16,6,90,67,52,9,14,4,4,5,5,79,52,31,16,13,2,6);
+INSERT INTO "match" VALUES(1120,12,'2025-08-24',91,'O','MU94','D0F6','7-5 6-3 7-5','R64',158,0,4,108,77,50,16,17,6,10,7,3,104,70,45,10,16,6,13);
+INSERT INTO "match" VALUES(1121,12,'2025-08-24',92,'O','DH58','M0HU','6-2 6-4 6-2','R64',122,6,4,92,58,40,17,13,12,14,5,8,85,37,23,17,13,2,9);
+INSERT INTO "match" VALUES(1122,12,'2025-08-24',93,'O','PL56','BT72','7-6(6) 6-3 5-7 5-7 7-5','R64',268,11,6,176,100,69,43,28,9,16,8,5,185,133,90,20,29,10,18);
+INSERT INTO "match" VALUES(1123,12,'2025-08-24',94,'O','Z355','F0BY','6-4 6-4 6-4','R64',148,9,4,102,70,48,15,15,3,5,4,12,96,69,46,8,15,9,14);
+INSERT INTO "match" VALUES(1124,12,'2025-08-24',95,'O','AG37','SX50','6-1 7-6(4) 7-6(5)','R64',178,14,5,106,74,59,17,16,6,7,4,9,129,86,59,17,15,10,13);
+INSERT INTO "match" VALUES(1125,12,'2025-08-24',96,'O','AE14','TE51','7-6(5) 1-6 4-6 6-3 7-5','R64',266,15,8,174,111,80,27,25,8,13,17,12,163,91,74,32,25,5,9);
+INSERT INTO "match" VALUES(1126,12,'2025-08-24',97,'O','L0BV','C0JP','6-4 6-4 6-4','R32',132,3,2,83,42,34,21,15,5,8,11,14,114,72,53,8,15,11,17);
+INSERT INTO "match" VALUES(1127,12,'2025-08-24',98,'O','RC91','BM95','4-6 6-3 6-3 6-2','R32',161,15,3,112,75,59,20,18,4,5,2,2,101,65,45,19,18,1,6);
+INSERT INTO "match" VALUES(1128,12,'2025-08-24',99,'O','A0E2','D0FJ','6-2 6-4 6-0','R32',104,9,1,70,49,39,11,12,2,3,5,8,78,42,26,10,12,11,18);
+INSERT INTO "match" VALUES(1129,12,'2025-08-24',100,'O','ME82','S0S1','3-6 6-3 4-6 6-4 RET','R32',183,4,3,130,80,58,25,19,7,10,11,3,107,80,61,11,19,6,9);
+INSERT INTO "match" VALUES(1130,12,'2025-08-24',101,'O','SL28','TD51','6-4 6-3 7-6(7)','R32',131,14,4,84,53,47,14,15,0,2,15,5,112,63,44,23,16,5,10);
+INSERT INTO "match" VALUES(1131,12,'2025-08-24',102,'O','FB98','K0EP','7-6(3) 6-7(9) 6-4 6-4','R32',181,20,1,127,79,66,29,22,1,2,16,5,129,69,55,34,22,3,6);
+INSERT INTO "match" VALUES(1132,12,'2025-08-24',103,'O','D643','N771','6-4 6-7(4) 6-2 6-3','R32',169,18,6,104,75,61,20,20,0,1,9,4,127,98,63,15,19,7,12);
+INSERT INTO "match" VALUES(1133,12,'2025-08-24',104,'O','M0FH','BV16','7-5 6-3 6-1','R32',109,6,2,77,47,35,18,14,3,5,4,6,85,43,24,16,14,2,9);
+INSERT INTO "match" VALUES(1134,12,'2025-08-24',105,'O','M0EJ','C0E9','6-3 6-2 2-0 RET','R32',96,3,5,62,34,25,16,10,5,6,0,2,57,37,20,5,9,4,9);
+INSERT INTO "match" VALUES(1135,12,'2025-08-24',106,'O','S0AG','SU55','5-7 6-4 6-3 6-3','R32',194,2,5,110,65,55,22,20,3,6,15,9,126,70,49,26,20,7,13);
+INSERT INTO "match" VALUES(1136,12,'2025-08-24',107,'O','DH58','AE14','6-7(7) 6-3 6-4 2-0 RET','R32',180,11,5,111,59,45,35,17,6,6,4,3,110,56,35,33,16,4,7);
+INSERT INTO "match" VALUES(1137,12,'2025-08-24',108,'O','RE44','W0BH','2-6 6-4 6-3 4-6 6-3','R32',190,15,8,139,72,57,36,23,3,6,25,4,142,89,63,27,23,7,11);
+INSERT INTO "match" VALUES(1138,12,'2025-08-24',109,'O','MU94','BU13','6-1 6-4 6-4','R32',131,1,2,82,57,39,12,14,3,7,3,8,84,47,27,10,13,5,13);
+INSERT INTO "match" VALUES(1139,12,'2025-08-24',110,'O','R0FS','MQ75','5-3 RET','R32',33,1,1,26,16,10,3,4,2,4,0,0,23,19,9,0,4,0,3);
+INSERT INTO "match" VALUES(1140,12,'2025-08-24',111,'O','AG37','Z355','4-6 7-6(7) 6-4 6-4','R32',196,10,8,130,85,65,28,21,7,9,12,5,133,107,69,17,0,3,6);
+INSERT INTO "match" VALUES(1141,12,'2025-08-24',112,'O','BK92','PL56','7-6(5) 6-7(4) 6-3 6-7(5) 6-1','R32',219,22,12,180,115,94,32,27,6,6,10,4,160,97,73,35,26,5,8);
+INSERT INTO "match" VALUES(1142,12,'2025-08-24',113,'O','L0BV','ME82','7-6(4) 6-4 2-6 6-2','R16',196,18,10,117,83,58,11,19,2,7,4,4,137,91,54,21,19,11,17);
+INSERT INTO "match" VALUES(1143,12,'2025-08-24',114,'O','A0E2','RC91','7-6(3) 6-3 6-4','R16',134,6,1,86,57,48,22,16,2,2,11,4,89,56,44,15,15,3,5);
+INSERT INTO "match" VALUES(1144,12,'2025-08-24',115,'O','FB98','M0FH','6-4 6-3 6-3','R16',99,14,2,69,49,42,14,14,0,0,4,3,81,60,40,10,14,4,8);
+INSERT INTO "match" VALUES(1145,12,'2025-08-24',116,'O','D643','SL28','6-3 6-3 6-2','R16',111,12,0,74,54,41,12,13,0,1,6,6,78,42,26,15,13,2,8);
+INSERT INTO "match" VALUES(1146,12,'2025-08-24',117,'O','DH58','R0FS','6-3 6-2 6-1','R16',93,9,3,77,48,35,14,12,4,6,3,9,70,36,17,12,12,7,15);
+INSERT INTO "match" VALUES(1147,12,'2025-08-24',118,'O','M0EJ','MU94','6-3 6-0 6-1','R16',98,7,4,65,33,27,21,11,4,4,2,5,56,27,13,12,11,1,8);
+INSERT INTO "match" VALUES(1148,12,'2025-08-24',119,'O','AG37','RE44','7-5 6-3 6-4','R16',137,13,4,91,60,50,17,16,3,4,6,4,93,50,35,21,15,3,7);
+INSERT INTO "match" VALUES(1149,12,'2025-08-24',120,'O','S0AG','BK92','6-1 6-1 6-1','R16',83,8,1,53,31,25,16,10,1,1,2,13,79,47,28,6,11,9,17);
+INSERT INTO "match" VALUES(1150,12,'2025-08-24',121,'O','A0E2','L0BV','6-4 6-2 6-4','QF',118,5,2,71,45,38,19,14,0,0,4,4,86,55,37,14,14,5,9);
+INSERT INTO "match" VALUES(1151,12,'2025-08-24',122,'O','D643','FB98','6-3 7-5 3-6 6-4','QF',207,10,8,139,88,63,28,20,11,13,12,5,117,66,54,24,20,5,9);
+INSERT INTO "match" VALUES(1152,12,'2025-08-24',123,'O','AG37','DH58','4-6 7-6(7) 7-5 7-6(4)','QF',253,22,11,148,95,78,17,23,6,10,8,11,163,71,54,46,23,5,9);
+INSERT INTO "match" VALUES(1153,12,'2025-08-24',124,'O','S0AG','M0EJ','6-1 6-4 6-2','QF',120,10,0,75,46,42,14,13,7,7,2,1,66,41,30,8,12,1,6);
+INSERT INTO "match" VALUES(1154,12,'2025-08-24',125,'O','A0E2','D643','6-4 7-6(4) 6-2','SF',146,7,2,89,50,42,21,15,0,1,4,5,93,56,37,18,15,3,7);
+INSERT INTO "match" VALUES(1155,12,'2025-08-24',126,'O','S0AG','AG37','6-1 3-6 6-3 6-4','SF',199,11,4,109,64,49,28,18,9,10,9,5,111,75,54,15,17,7,11);
+INSERT INTO "match" VALUES(1156,12,'2025-08-24',127,'O','A0E2','S0AG','6-2 3-6 6-1 6-4','F',164,10,0,89,54,45,19,17,0,1,2,4,112,54,37,28,17,6,11);
+INSERT INTO "match" VALUES(1157,13,'2025-01-13',1,'O','FB98','B0CD','6-2 6-0 6-3','R128',106,7,1,70,47,39,14,12,2,2,1,4,80,47,31,7,11,1,7);
+INSERT INTO "match" VALUES(1158,13,'2025-01-13',2,'O','MM58','S0HR','6-2 4-6 3-6 6-1 6-2','R128',188,24,8,104,58,53,28,21,4,6,4,6,155,91,59,29,21,7,13);
+INSERT INTO "match" VALUES(1159,13,'2025-01-13',3,'O','DH58','V812','6-1 7-5 6-4','R128',142,13,4,93,59,48,17,15,4,5,5,7,90,45,29,21,14,5,10);
+INSERT INTO "match" VALUES(1160,13,'2025-01-13',4,'O','F0FV','RE44','7-6(1) 6-3 7-6(5)','R128',147,14,1,120,84,66,19,17,5,6,13,5,105,73,50,18,16,8,10);
+INSERT INTO "match" VALUES(1161,13,'2025-01-13',5,'O','R0DG','Z371','4-6 6-3 6-4 3-6 6-4','R128',190,10,4,131,86,62,31,24,3,6,21,2,142,92,71,22,24,6,10);
+INSERT INTO "match" VALUES(1162,13,'2025-01-13',6,'O','M0EJ','A0FC','7-6(4) 4-6 7-6(5) 6-3','R128',246,6,5,147,89,56,30,22,8,16,7,13,183,96,60,40,21,19,28);
+INSERT INTO "match" VALUES(1163,13,'2025-01-13',7,'O','HB71','GJ37','7-5 6-4 6-4','R128',143,14,1,83,63,49,13,16,0,1,10,5,120,71,50,22,16,14,18);
+INSERT INTO "match" VALUES(1164,13,'2025-01-13',8,'O','KE29','ME82','7-6(5) 6-3 6-3','R128',140,6,4,81,53,44,14,15,1,4,4,7,106,47,30,26,15,4,10);
+INSERT INTO "match" VALUES(1165,13,'2025-01-13',9,'O','S0S1','N0AE','7-6(3) 7-5 7-5','R128',160,12,3,113,67,49,30,18,2,3,9,2,111,73,52,22,18,5,8);
+INSERT INTO "match" VALUES(1166,13,'2025-01-13',10,'O','MW02','P09Z','4-6 6-3 6-4 6-4','R128',214,6,2,124,72,54,30,20,9,12,1,7,144,93,62,20,19,14,19);
+INSERT INTO "match" VALUES(1167,13,'2025-01-13',11,'O','MC65','M0GZ','7-6(7) 6-3 6-7(6) 6-7(5) 6-4','R128',226,18,16,174,102,86,42,28,0,0,19,9,181,113,84,42,27,10,12);
+INSERT INTO "match" VALUES(1168,13,'2025-01-13',12,'O','C0AU','BK92','7-6(1) 6-3 6-2','R128',109,6,3,83,50,42,19,15,1,3,10,15,106,57,41,14,14,8,13);
+INSERT INTO "match" VALUES(1169,13,'2025-01-13',13,'O','EA24','C0E9','6-7(8) 6-3 7-5 6-1','R128',215,16,3,136,84,64,30,20,7,8,10,3,150,86,52,37,20,9,15);
+INSERT INTO "match" VALUES(1170,13,'2025-01-13',14,'O','AE14','C0DF','6-2 3-6 7-6(4) 4-6 6-4','R128',202,13,5,132,84,74,26,25,2,4,18,5,146,92,78,24,24,3,6);
+INSERT INTO "match" VALUES(1171,13,'2025-01-13',15,'O','BK40','N771','6-7(4) 6-4 6-1 6-3','R128',176,32,7,114,80,68,16,19,5,5,13,2,138,91,61,22,19,9,14);
+INSERT INTO "match" VALUES(1172,13,'2025-01-13',16,'O','B0EJ','CE77','6-3 6-7(3) 4-6 7-5 6-1','R128',231,10,1,139,97,78,24,25,2,5,10,8,163,104,72,28,25,6,12);
+INSERT INTO "match" VALUES(1173,13,'2025-01-13',17,'O','CD85','MQ75','6-4 6-4 6-3','R128',123,6,1,86,62,46,14,15,5,5,4,2,88,62,43,12,14,5,9);
+INSERT INTO "match" VALUES(1174,13,'2025-01-13',18,'O','D0F6','N0BG','6-7(1) 7-6(3) 5-7 6-1 6-2','R128',249,21,8,167,104,78,32,26,11,15,9,13,167,94,63,38,25,9,16);
+INSERT INTO "match" VALUES(1175,13,'2025-01-13',19,'O','D0CG','BU13','6-7(5) 6-4 1-6 6-3 6-4','R128',246,8,9,154,93,72,31,24,8,11,12,9,161,86,64,40,24,12,16);
+INSERT INTO "match" VALUES(1176,13,'2025-01-13',20,'O','GD64','CG80','7-5 6-1 6-2','R128',123,7,2,62,34,30,20,14,0,1,3,4,85,44,27,18,13,6,13);
+INSERT INTO "match" VALUES(1177,13,'2025-01-13',21,'O','GC88','H997','2-6 7-5 6-1 7-5','R128',182,9,3,116,70,48,25,20,3,8,11,2,138,87,57,21,19,16,23);
+INSERT INTO "match" VALUES(1178,13,'2025-01-13',22,'O','KI95','L987','7-5 3-6 6-3 3-6 6-3','R128',206,10,5,172,102,71,36,24,16,20,17,3,158,101,69,29,24,7,12);
+INSERT INTO "match" VALUES(1179,13,'2025-01-13',23,'O','KC12','H0BH','6-4 6-4 6-3','R128',131,6,1,79,62,42,11,15,5,8,8,8,103,57,37,18,14,8,15);
+INSERT INTO "match" VALUES(1180,13,'2025-01-13',24,'O','SU55','BD06','3-6 6-4 6-4 7-6(8)','R128',191,24,15,131,63,55,26,21,6,10,2,5,136,99,59,22,20,13,17);
+INSERT INTO "match" VALUES(1181,13,'2025-01-13',25,'O','SU87','W367','6-4 5-7 7-5 7-5','R128',191,12,6,132,82,69,27,23,9,11,6,3,112,56,41,40,23,1,5);
+INSERT INTO "match" VALUES(1182,13,'2025-01-13',26,'O','T0HA','U182','4-6 7-6(3) 6-3 5-7 6-4','R128',236,7,16,168,102,74,29,27,7,14,10,9,178,112,81,26,26,13,20);
+INSERT INTO "match" VALUES(1183,13,'2025-01-13',27,'O','S0AG','J551','7-6(2) 7-6(5) 6-1','R128',160,7,1,101,58,48,30,16,2,2,13,4,98,71,52,13,15,3,5);
+INSERT INTO "match" VALUES(1184,13,'2025-01-13',28,'O','A0E2','S0H2','6-1 7-5 6-1','R128',114,6,4,81,48,33,22,13,2,4,0,0,89,53,28,14,13,11,19);
+INSERT INTO "match" VALUES(1185,13,'2025-01-13',29,'O','D643','B0NN','4-6 6-3 6-4 6-2','R128',179,23,4,106,72,56,21,19,2,3,4,8,129,71,51,26,18,7,11);
+INSERT INTO "match" VALUES(1186,13,'2025-01-13',30,'O','P0CT','D875','7-5 2-1 RET','R128',65,5,0,39,22,16,12,8,0,0,6,4,54,38,25,7,7,2,4);
+INSERT INTO "match" VALUES(1187,13,'2025-01-13',31,'O','M0QI','TE51','7-5 6-3 2-6 6-4','R128',163,8,8,124,85,59,20,20,3,7,13,2,116,72,50,23,19,7,12);
+INSERT INTO "match" VALUES(1188,13,'2025-01-13',32,'O','PL56','O483','6-2 3-6 6-1 6-7(5) 7-5','R128',240,15,3,149,91,73,29,24,6,8,11,1,178,114,76,29,24,14,20);
+INSERT INTO "match" VALUES(1189,13,'2025-01-13',33,'O','D0CO','N0BS','4-6 6-3 3-6 6-3 6-2','R128',241,13,3,160,93,62,32,23,12,17,5,4,160,108,64,27,22,10,17);
+INSERT INTO "match" VALUES(1190,13,'2025-01-13',34,'O','TD51','RC91','7-6(2) 6-3 4-6 6-7(4) 6-3','R128',248,14,8,169,98,77,40,26,8,10,33,10,161,94,79,30,26,5,10);
+INSERT INTO "match" VALUES(1191,13,'2025-01-13',35,'O','K0AH','KI63','6-3 0-6 6-3 7-6(6)','R128',147,7,3,113,68,44,25,18,6,10,11,4,108,64,45,24,18,4,8);
+INSERT INTO "match" VALUES(1192,13,'2025-01-13',36,'O','CF59','TE30','1-6 6-2 6-3 7-6(1)','R128',171,7,2,113,75,49,23,18,8,12,9,2,110,66,46,17,18,5,10);
+INSERT INTO "match" VALUES(1193,13,'2025-01-13',37,'O','TC61','KE73','7-6(3) 6-4 4-6 6-3','R128',195,18,3,128,67,52,36,21,8,12,5,6,116,69,51,24,20,3,8);
+INSERT INTO "match" VALUES(1194,13,'2025-01-13',38,'O','C0H0','B0BI','6-3 5-7 3-6 6-0 6-3','R128',224,10,1,143,84,60,33,23,7,11,1,3,129,97,65,15,22,6,13);
+INSERT INTO "match" VALUES(1195,13,'2025-01-13',39,'O','AG37','SL28','6-3 6-0 4-6 6-1','R128',144,19,3,93,65,52,14,16,2,4,15,4,114,67,35,22,16,12,20);
+INSERT INTO "match" VALUES(1196,13,'2025-01-13',40,'O','BM95','GB88','6-1 6-2 7-6(7)','R128',133,12,3,105,62,43,23,14,5,8,8,3,85,43,27,16,13,7,14);
+INSERT INTO "match" VALUES(1197,13,'2025-01-13',41,'O','BT72','MP20','6-7(2) 6-3 6-2 7-5','R128',175,20,5,123,85,66,21,21,4,5,7,2,125,83,58,19,20,5,10);
+INSERT INTO "match" VALUES(1198,13,'2025-01-13',42,'O','DH50','S0RE','7-6(1) 5-2 RET','R128',111,0,4,58,30,21,15,10,1,4,3,4,89,51,29,14,9,7,12);
+INSERT INTO "match" VALUES(1199,13,'2025-01-13',43,'O','D994','S0LA','6-2 6-4 6-2','R128',96,10,1,69,40,34,19,13,1,1,7,3,78,45,30,15,13,1,6);
+INSERT INTO "match" VALUES(1200,13,'2025-01-13',44,'O','F0F2','K09F','6-1 6-1 7-5','R128',105,10,3,70,44,34,20,13,2,2,9,7,84,42,29,15,13,4,10);
+INSERT INTO "match" VALUES(1201,13,'2025-01-13',45,'O','F0BY','KE17','7-6(3) 6-3 7-6(2)','R128',139,17,8,110,68,55,27,17,2,3,13,8,119,87,60,14,16,9,11);
+INSERT INTO "match" VALUES(1202,13,'2025-01-13',46,'O','KD46','SX50','3-6 6-3 6-3 7-6(5)','R128',245,23,1,158,106,76,18,20,18,22,14,2,130,91,59,18,19,2,8);
+INSERT INTO "match" VALUES(1203,13,'2025-01-13',47,'O','M0CI','SX91','6-3 6-7(5) 7-5 5-7 7-5','R128',236,20,1,165,118,88,32,29,2,4,23,6,190,132,102,24,28,12,16);
+INSERT INTO "match" VALUES(1204,13,'2025-01-13',48,'O','M0OQ','L0IL','6-4 6-3 6-4','R128',127,14,2,82,63,52,12,15,1,1,9,8,92,54,41,15,14,6,9);
+INSERT INTO "match" VALUES(1205,13,'2025-01-13',49,'O','M0NI','BG23','6-1 6-7(3) 6-3 6-3','R128',153,31,8,125,68,56,29,19,11,12,10,9,116,58,45,24,18,5,11);
+INSERT INTO "match" VALUES(1206,13,'2025-01-13',50,'O','N732','DF88','3-6 6-4 7-6(3) 6-3','R128',179,3,1,117,70,50,31,20,5,8,18,7,135,85,63,16,20,6,11);
+INSERT INTO "match" VALUES(1207,13,'2025-01-13',51,'O','S0N0','DA81','6-7(6) 7-6(4) 6-1 6-4','R128',194,23,4,133,72,61,35,21,8,10,8,1,128,86,63,20,20,7,12);
+INSERT INTO "match" VALUES(1208,13,'2025-01-13',52,'O','V832','D923','6-7(3) 6-0 3-6 6-3 6-4','R128',199,24,3,131,76,57,30,23,6,10,3,4,149,94,52,34,23,7,15);
+INSERT INTO "match" VALUES(1209,13,'2025-01-13',53,'O','Z355','PF39','6-4 6-4 6-4','R128',141,18,2,88,64,50,15,15,2,2,3,7,113,62,45,21,15,15,18);
+INSERT INTO "match" VALUES(1210,13,'2025-01-13',54,'O','RH16','MU94','6-3 1-6 7-5 2-6 6-1','R128',201,7,2,123,83,57,23,22,3,8,10,3,138,90,66,18,21,7,12);
+INSERT INTO "match" VALUES(1211,13,'2025-01-13',55,'O','HH26','G0GD','7-6(5) 7-5 6-4','R128',169,9,4,107,67,50,25,17,2,3,16,7,119,75,58,21,17,6,9);
+INSERT INTO "match" VALUES(1212,13,'2025-01-13',56,'O','F0F1','V0AM','3-6 7-6(4) 6-4 6-4','R128',165,15,2,116,74,60,23,21,2,4,11,12,146,80,59,32,20,7,10);
+INSERT INTO "match" VALUES(1213,13,'2025-01-13',57,'O','L0BV','TC01','6-1 3-6 6-3 7-6(1)','R128',140,13,2,103,67,54,26,19,3,4,8,4,107,66,50,21,18,3,6);
+INSERT INTO "match" VALUES(1214,13,'2025-01-13',58,'O','M0FH','N897','6-3 6-1 7-5','R128',125,7,4,82,40,31,25,14,5,7,0,5,85,58,31,10,14,8,15);
+INSERT INTO "match" VALUES(1215,13,'2025-01-13',59,'O','G09O','J553','6-2 3-6 6-2 6-2','R128',150,12,2,101,61,46,22,17,7,9,2,3,109,85,51,9,16,4,11);
+INSERT INTO "match" VALUES(1216,13,'2025-01-13',60,'O','HF80','Y09V','7-6(4) 6-4 7-6(6)','R128',151,18,2,89,59,52,23,17,0,1,13,3,112,64,44,30,17,3,5);
+INSERT INTO "match" VALUES(1217,13,'2025-01-13',61,'O','HB64','W09E','4-6 4-6 6-4 7-6(4) 7-5','R128',218,31,6,164,99,83,32,27,4,6,11,1,157,105,78,35,27,3,5);
+INSERT INTO "match" VALUES(1218,13,'2025-01-13',62,'O','MO44','D0FJ','6-3 4-1 RET','R128',72,1,2,42,32,23,6,7,4,5,3,4,57,36,20,6,7,3,7);
+INSERT INTO "match" VALUES(1219,13,'2025-01-13',63,'O','N552','MJ08','4-6 6-7(4) 7-5 6-2 6-3','R128',246,17,3,140,101,82,22,26,6,7,21,5,169,108,80,31,25,14,19);
+INSERT INTO "match" VALUES(1220,13,'2025-01-13',64,'O','O522','O0A2','3-6 7-6(4) 6-3 6-2','R128',191,38,5,160,115,85,15,19,10,13,2,4,121,83,54,20,19,3,7);
+INSERT INTO "match" VALUES(1221,13,'2025-01-13',65,'O','S0AG','S0N0','4-6 6-4 6-1 6-3','R64',166,14,5,100,62,48,21,18,0,1,13,10,138,83,59,19,18,8,13);
+INSERT INTO "match" VALUES(1222,13,'2025-01-13',66,'O','FB98','GD64','6-2 6-1 6-0','R64',82,8,1,60,40,32,12,11,0,0,2,3,62,40,20,7,10,2,9);
+INSERT INTO "match" VALUES(1223,13,'2025-01-13',67,'O','T0HA','MM58','6-3 7-6(4) 6-7(8) 1-6 7-6(7)','R64',288,7,4,201,142,86,26,26,14,24,20,9,169,95,67,32,26,6,15);
+INSERT INTO "match" VALUES(1224,13,'2025-01-13',68,'O','DH58','B0EJ','6-2 6-4 6-3','R64',119,6,3,64,34,30,21,14,1,2,3,2,96,63,40,11,13,8,14);
+INSERT INTO "match" VALUES(1225,13,'2025-01-13',69,'O','R0DG','BK40','7-6(3) 2-6 6-3 7-6(6)','R64',207,8,6,127,81,59,28,21,6,10,16,2,149,108,70,23,20,7,10);
+INSERT INTO "match" VALUES(1226,13,'2025-01-13',70,'O','M0EJ','SU55','7-6(3) 7-6(6) 6-2','R64',162,3,4,111,76,58,19,16,4,5,5,15,112,65,46,20,16,8,11);
+INSERT INTO "match" VALUES(1227,13,'2025-01-13',71,'O','M0CI','TD51','6-7(3) 6-4 3-6 6-4 6-1','R64',197,14,6,172,101,74,39,24,17,20,19,10,150,85,67,28,24,11,17);
+INSERT INTO "match" VALUES(1228,13,'2025-01-13',72,'O','KI95','HB71','6-4 6-4 6-2','R64',111,6,0,84,49,38,24,14,3,3,14,6,82,53,41,11,14,7,11);
+INSERT INTO "match" VALUES(1229,13,'2025-01-13',73,'O','KE29','D0F6','7-6(4) 4-6 6-3 6-3','R64',194,10,1,122,71,56,32,20,4,5,15,4,135,87,66,22,20,7,10);
+INSERT INTO "match" VALUES(1230,13,'2025-01-13',74,'O','S0S1','CD85','6-3 6-3 6-7(4) 6-4','R64',156,17,4,111,68,58,30,20,6,6,3,1,109,74,59,19,20,1,5);
+INSERT INTO "match" VALUES(1231,13,'2025-01-13',75,'O','C0AU','D0CG','6-2 1-0 RET','R64',40,2,0,26,17,12,5,5,1,2,0,2,27,18,7,3,4,2,6);
+INSERT INTO "match" VALUES(1232,13,'2025-01-13',76,'O','GC88','EA24','7-5 3-6 7-5 3-6 6-4','R64',246,8,1,163,98,64,34,26,11,19,14,1,153,94,60,30,26,6,14);
+INSERT INTO "match" VALUES(1233,13,'2025-01-13',77,'O','M0QI','M0OQ','7-5 6-3 7-6(4)','R64',135,8,2,96,76,61,14,17,0,0,10,4,110,65,48,19,16,12,14);
+INSERT INTO "match" VALUES(1234,13,'2025-01-13',78,'O','MC65','AE14','7-5 6-3 7-6(3)','R64',139,12,8,99,57,47,21,17,2,5,4,2,99,55,36,22,16,5,10);
+INSERT INTO "match" VALUES(1235,13,'2025-01-13',79,'O','MW02','KC12','4-6 6-4 7-6(3) 6-4','R64',217,7,5,147,97,66,24,21,5,9,4,5,137,82,55,30,21,6,11);
+INSERT INTO "match" VALUES(1236,13,'2025-01-13',80,'O','SU87','F0FV','6-7(6) 6-3 6-1 3-6 6-3','R64',217,12,3,140,93,72,27,23,5,6,11,6,146,88,62,29,23,7,12);
+INSERT INTO "match" VALUES(1237,13,'2025-01-13',81,'O','Z355','MO44','6-1 6-4 6-1','R64',114,8,2,73,54,41,12,12,6,6,0,4,72,49,26,8,12,7,13);
+INSERT INTO "match" VALUES(1238,13,'2025-01-13',82,'O','A0E2','N732','6-0 6-1 6-4','R64',81,14,3,60,36,32,17,12,0,0,1,3,61,33,19,11,11,4,10);
+INSERT INTO "match" VALUES(1239,13,'2025-01-13',83,'O','M0NI','RH16','6-2 3-6 6-1 6-4','R64',164,22,1,108,65,46,28,17,7,8,7,6,121,75,47,22,17,11,16);
+INSERT INTO "match" VALUES(1240,13,'2025-01-13',84,'O','D643','F0F2','6-1 6-7(4) 6-3 6-2','R64',180,14,2,113,74,56,22,18,5,7,14,6,107,63,40,17,18,5,12);
+INSERT INTO "match" VALUES(1241,13,'2025-01-13',85,'O','PL56','N552','6-7(3) 6-0 6-3 6-1','R64',161,8,2,104,74,55,11,17,1,5,0,5,129,86,41,18,17,7,18);
+INSERT INTO "match" VALUES(1242,13,'2025-01-13',86,'O','HH26','HF80','6-3 6-4 6-4','R64',101,17,1,75,50,43,18,15,0,0,11,4,89,58,42,14,14,7,10);
+INSERT INTO "match" VALUES(1243,13,'2025-01-13',87,'O','D0CO','KD46','6-7(3) 6-3 3-6 7-5 6-3','R64',275,12,4,157,97,69,40,26,4,7,11,4,164,115,86,19,25,6,11);
+INSERT INTO "match" VALUES(1244,13,'2025-01-13',88,'O','F0F1','HB64','6-2 4-6 7-6(2) 7-5','R64',172,12,5,120,79,64,24,21,5,6,24,4,125,81,59,23,21,4,7);
+INSERT INTO "match" VALUES(1245,13,'2025-01-13',89,'O','V832','K0AH','6-4 3-6 2-6 6-3 7-5','R64',197,17,5,150,94,66,33,24,10,14,21,4,131,81,61,29,24,2,6);
+INSERT INTO "match" VALUES(1246,13,'2025-01-13',90,'O','L0BV','G09O','6-3 3-1 RET','R64',57,6,2,44,19,19,11,7,3,4,1,1,57,39,23,5,6,5,8);
+INSERT INTO "match" VALUES(1247,13,'2025-01-13',91,'O','M0FH','O522','3-6 7-6(1) 6-7(5) 7-6(4) 6-4','R64',205,16,7,167,105,88,36,28,7,8,40,16,173,115,102,24,27,4,5);
+INSERT INTO "match" VALUES(1248,13,'2025-01-13',92,'O','BT72','TC61','6-3 6-2 6-4','R64',107,6,0,81,62,46,15,14,2,2,6,2,81,51,32,14,13,5,9);
+INSERT INTO "match" VALUES(1249,13,'2025-01-13',93,'O','DH50','AG37','6-7(7) 6-7(5) 6-4 6-1 6-3','R64',291,7,3,176,112,78,36,25,6,10,11,6,152,108,69,22,25,9,18);
+INSERT INTO "match" VALUES(1250,13,'2025-01-13',94,'O','BM95','P0CT','6-2 6-4 3-6 6-4','R64',130,2,1,104,75,54,19,19,7,9,8,3,100,71,50,18,18,4,9);
+INSERT INTO "match" VALUES(1251,13,'2025-01-13',95,'O','CF59','D994','6-4 6-2 7-5','R64',171,10,1,77,51,42,19,15,0,0,6,3,111,67,41,22,15,11,15);
+INSERT INTO "match" VALUES(1252,13,'2025-01-13',96,'O','F0BY','C0H0','3-6 7-5 6-2 6-3','R64',177,9,9,111,69,51,21,19,4,8,5,2,106,62,41,21,19,6,13);
+INSERT INTO "match" VALUES(1253,13,'2025-01-13',97,'O','S0AG','GC88','6-3 6-4 6-2','R32',121,8,2,83,50,41,17,14,6,7,2,2,82,48,32,12,13,5,10);
+INSERT INTO "match" VALUES(1254,13,'2025-01-13',98,'O','MC65','FB98','3-6 7-5 7-6(1) 6-4','R32',188,24,4,121,74,61,32,22,3,4,12,0,130,87,65,25,21,4,6);
+INSERT INTO "match" VALUES(1255,13,'2025-01-13',99,'O','DH58','C0AU','5-7 7-6(3) 6-3 6-3','R32',233,7,9,137,67,47,39,21,4,9,5,6,152,79,50,34,21,9,16);
+INSERT INTO "match" VALUES(1256,13,'2025-01-13',100,'O','R0DG','KI95','6-7(5) 6-3 4-6 6-4 6-4','R32',207,16,5,158,95,73,28,26,3,8,4,6,149,95,66,27,25,8,15);
+INSERT INTO "match" VALUES(1257,13,'2025-01-13',101,'O','S0S1','M0EJ','6-3 3-6 6-4 7-6(5)','R32',172,11,3,119,83,67,17,20,4,6,2,3,116,69,51,28,20,3,6);
+INSERT INTO "match" VALUES(1258,13,'2025-01-13',102,'O','M0QI','KE29','6-3 7-6(5) 6-2','R32',134,8,4,99,62,45,22,15,2,3,14,1,83,52,38,15,14,0,4);
+INSERT INTO "match" VALUES(1259,13,'2025-01-13',103,'O','SU87','M0CI','6-7(3) 7-6(6) 6-1 6-2','R32',196,15,3,130,81,69,26,20,5,5,9,7,134,86,63,23,19,11,15);
+INSERT INTO "match" VALUES(1260,13,'2025-01-13',104,'O','T0HA','MW02','7-6(10) 6-3 6-3','R32',169,1,5,107,56,41,28,15,10,13,3,2,107,75,45,15,15,9,15);
+INSERT INTO "match" VALUES(1261,13,'2025-01-13',105,'O','Z355','F0BY','6-3 6-4 6-4','R32',122,7,1,81,58,46,12,15,4,6,6,6,79,52,32,13,14,7,12);
+INSERT INTO "match" VALUES(1262,13,'2025-01-13',106,'O','A0E2','BT72','6-2 6-4 6-7(3) 6-2','R32',175,9,3,109,67,56,24,19,3,3,3,1,137,94,60,23,19,8,13);
+INSERT INTO "match" VALUES(1263,13,'2025-01-13',107,'O','D643','M0FH','6-1 6-4 6-4','R32',142,9,4,79,51,41,15,14,2,3,4,5,87,55,35,12,13,10,15);
+INSERT INTO "match" VALUES(1264,13,'2025-01-13',108,'O','PL56','CF59','7-6(0) 6-2 6-0','R32',143,7,2,86,47,37,20,13,3,5,3,10,98,54,37,9,13,9,16);
+INSERT INTO "match" VALUES(1265,13,'2025-01-13',109,'O','HH26','F0F1','4-6 7-5 6-4 1-0 RET','R32',157,3,6,102,65,50,14,17,4,7,6,3,101,62,42,18,16,5,10);
+INSERT INTO "match" VALUES(1266,13,'2025-01-13',110,'O','D0CO','V832','6-4 2-6 5-7 7-6(5) 7-6(8)','R32',238,29,4,164,112,84,27,27,8,14,22,6,188,119,93,28,27,14,18);
+INSERT INTO "match" VALUES(1267,13,'2025-01-13',111,'O','L0BV','BM95','6-2 6-3 6-3','R32',107,9,1,76,52,42,14,13,2,2,1,2,85,51,29,19,13,3,8);
+INSERT INTO "match" VALUES(1268,13,'2025-01-13',112,'O','DH50','M0NI','3-6 4-6 7-6(7) 6-4 6-2','R32',210,4,3,156,108,74,25,25,17,22,16,7,142,81,67,24,24,3,9);
+INSERT INTO "match" VALUES(1269,13,'2025-01-13',113,'O','S0AG','R0DG','6-3 3-6 6-3 6-2','R16',193,14,6,105,59,49,27,18,4,5,5,4,110,68,45,21,17,4,8);
+INSERT INTO "match" VALUES(1270,13,'2025-01-13',114,'O','DH58','M0QI','6-0 7-6(5) 6-3','R16',129,5,1,90,38,30,33,14,3,4,3,1,87,58,35,14,13,6,11);
+INSERT INTO "match" VALUES(1271,13,'2025-01-13',115,'O','S0S1','MC65','7-6(3) 6-7(3) 7-6(2) 1-0 RET','R16',177,7,3,120,83,67,20,19,5,6,12,9,124,74,61,23,18,2,4);
+INSERT INTO "match" VALUES(1272,13,'2025-01-13',116,'O','SU87','T0HA','6-3 6-2 3-6 6-1','R16',145,20,2,95,63,57,14,17,3,4,4,7,102,58,43,14,16,6,11);
+INSERT INTO "match" VALUES(1273,13,'2025-01-13',117,'O','Z355','HH26','6-1 2-6 6-3 6-2','R16',136,19,3,86,61,51,12,16,5,7,12,3,104,74,51,7,16,10,16);
+INSERT INTO "match" VALUES(1274,13,'2025-01-13',118,'O','A0E2','D0CO','7-5 6-1 RET','R16',95,6,5,59,40,33,7,10,2,3,5,2,68,40,22,12,9,8,12);
+INSERT INTO "match" VALUES(1275,13,'2025-01-13',119,'O','D643','L0BV','6-3 6-4 7-6(4)','R16',159,9,3,92,54,44,24,16,2,3,11,4,106,60,47,19,15,8,11);
+INSERT INTO "match" VALUES(1276,13,'2025-01-13',120,'O','PL56','DH50','6-1 6-1 6-1','R16',87,8,0,67,45,38,12,11,3,3,2,0,61,36,18,8,10,6,13);
+INSERT INTO "match" VALUES(1277,13,'2025-01-13',121,'O','S0AG','DH58','6-3 6-2 6-1','QF',108,2,0,59,38,32,17,12,1,1,2,1,78,40,26,15,12,4,10);
+INSERT INTO "match" VALUES(1278,13,'2025-01-13',122,'O','S0S1','SU87','6-4 7-5 4-6 7-6(4)','QF',230,9,4,141,100,75,24,22,6,8,3,1,153,101,72,27,22,8,11);
+INSERT INTO "match" VALUES(1279,13,'2025-01-13',123,'O','Z355','PL56','7-6(1) 7-6(0) 2-6 6-1','QF',208,7,5,135,93,67,22,20,7,11,9,2,118,76,51,21,19,3,7);
+INSERT INTO "match" VALUES(1280,13,'2025-01-13',124,'O','D643','A0E2','4-6 6-4 6-3 6-4','QF',217,5,3,136,86,54,29,20,7,11,10,5,125,92,62,11,19,7,13);
+INSERT INTO "match" VALUES(1281,13,'2025-01-13',125,'O','S0AG','S0S1','7-6(2) 6-2 6-2','SF',156,8,0,89,51,38,24,14,5,7,7,6,118,70,40,22,14,7,13);
+INSERT INTO "match" VALUES(1282,13,'2025-01-13',126,'O','Z355','D643','7-6(5) RET','SF',81,8,1,38,29,24,7,6,3,3,5,0,54,29,21,15,6,5,5);
+INSERT INTO "match" VALUES(1283,13,'2025-01-13',127,'O','S0AG','Z355','6-3 7-6(4) 6-3','F',162,6,2,95,57,48,24,15,0,0,12,2,95,65,45,15,15,8,10);
+
+-- save everything
+COMMIT;
+
+-- final safety check that shows nothing when every foreign key is fine
+PRAGMA foreign_key_check;
+
+
+-- part 2 the five queries for task 2
+-- each query uses a different technique
+-- the titles in the output come from the print lines
+
+-- show the column names and line the output up in columns
+.headers on
+.mode column
+
+
+-- query 1 join
+.print ''
+.print '=== Query 1 (join): Which tournaments were played on clay during 2025 season? ==='
+-- get the tournament names
+SELECT series_name FROM tournament_series ts
+-- get the tournaments played on 2025 with their venues
+JOIN tournament_edition te ON te.series_id = ts.series_id
+-- get the venues and their surface info
+JOIN venue v ON v.venue_id = te.venue_id
+-- keep only the clay courts
+WHERE v.surface = 'Clay';
+
+
+-- query 2 aggregate function
+.print ''
+.print '=== Query 2 (aggregate): Across all 2025 events in the database, what is the average match duration in each round, and which round lasts longer? ==='
+-- get round names and their avg duration with one decimal point
+SELECT r.round_name, ROUND(AVG(m.minutes), 1) AS avg_minutes
+FROM "match" m
+-- round holds the full name of the rounds
+JOIN round r ON r.round_code = m.round_code
+-- get one result per round
+GROUP BY r.round_name
+-- the longest round on avg appears first
+ORDER BY avg_minutes DESC;
+
+
+-- query 3 nested query
+.print ''
+.print '=== Query 3 (nested query): Which players are taller than the average player in the database? ==='
+-- get the players and their heights
+SELECT player_name, height_cm FROM player
+-- keep only the players that their height is above the average height
+WHERE height_cm > (SELECT AVG(height_cm) FROM player);
+
+
+-- query 4 self join
+.print ''
+.print '=== Query 4 (self join): Which pairs of players were born in the same city? ==='
+-- get pairs of players born in the same city
+SELECT c.city, p1.player_name AS player_1, p2.player_name AS player_2
+FROM player p1
+-- self join with player to get the 2nd copy of player table
+JOIN player p2 on p1.birthplace_id = p2.birthplace_id
+-- join with city to get the actual city names
+JOIN city c on c.city_id = p1.birthplace_id
+-- keep each pair once and avoid pairing a player with themselves
+WHERE p1.player_id < p2.player_id
+-- see the pairs ordered by city
+ORDER BY c.city;
+
+
+-- query 5 set operation
+.print ''
+.print '=== Query 5 (set operation): Which players have no coach recorded in the database? ==='
+-- get all players that do not have recorded coach links
+SELECT p.player_name FROM player p
+WHERE p.player_id IN (
+	-- all players in the database
+	SELECT player_id FROM player
+	-- without
+	EXCEPT
+	-- players that have recorded coach/-es
+	SELECT player_id FROM coach_player
+)
+-- get the results ordered by player name
+ORDER BY p.player_name;

@@ -1,0 +1,12 @@
+# Generated database
+*.db
+*.sqlite
+
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
